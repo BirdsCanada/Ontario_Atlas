@@ -1,0 +1,717 @@
+---
+title: "Change estimates by species groups"
+format: 
+  pdf:
+    df-engine: xelatex
+    geometry:
+      - landscape
+      - margin=1in
+execute: 
+  echo: false
+  warning: false
+  message: false
+---
+
+
+```{r}
+#| label: setup-dat
+#| include: false
+#| message: false
+library(tidyverse)
+library(sf)
+eccc_core <-
+  "c:/users/hoped/OneDrive - EC-EC/Avian_Core_20251124.xlsx" |>
+  readxl::read_excel()
+
+soc_groups <- read_csv("SOCB_Report_Groups_2024.csv")
+paired_sum <- read_rds(
+  "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries.rds"
+) |>
+  transpose() |>
+  pluck("shared_change_summary") |>
+  list_rbind() |>
+  mutate(model_name = "Paired Sites - Point Counts", sp_english = sp_name)
+
+paired_sum_aru <-
+  read_rds(
+    "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries_with_ARU.rds"
+  ) |>
+  transpose() |>
+  pluck("shared_change_summary") |>
+  list_rbind() |>
+  mutate(model_name = "Paired Sites - PC_ARU", sp_english = sp_name)
+
+
+paired <- bind_rows(paired_sum, paired_sum_aru) |>
+  mutate(
+    pct_change_median = pct_change_q50,
+    pct_change_qlow = pct_change_q10,
+    pct_change_qhigh = pct_change_q90
+  )
+
+sg <- distinct(
+  soc_groups[soc_groups$include...4 == 'Y', ],
+  english_name,
+  Group
+) |>
+  mutate(
+    sp_english = case_when(
+      english_name == "Herring Gull" ~ "American Herring Gull",
+      english_name == "Warbling Vireo" ~ "Eastern Warbling Vireo",
+      english_name ==
+        "Golden-winged x Blue-winged Warbler" ~ "Golden-winged/Blue-winged Warbler",
+      english_name == "Whimbrel" ~ "Hudsonian Whimbrel",
+      english_name == "House Wren" ~ "Northern House Wren",
+      english_name == "Yellow Warbler" ~ "Northern Yellow Warbler",
+      str_detect(english_name, "Rock Pigeon") ~ "Rock Pigeon (Feral Pigeon)",
+      str_detect(english_name, "Redpoll") ~ "Redpoll",
+      TRUE ~ english_name
+    )
+  )
+
+d_change_models <-
+  list.files(
+    "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output",
+    "regional_change_estimates\\w+.rds",
+    recursive = T,
+    full.names = T
+  ) |>
+  str_subset("_PC_ARU_SS", negate = T) |>
+  map(read_rds) |>
+  list_rbind() |> 
+  filter(model_name != "PC_ARU_CL") 
+
+mod_ss <- d_change_models[d_change_models$model_name=="PC_ARU_CL_SS",]
+d_change_models <- 
+  bind_rows(
+    mod_ss,
+    filter(d_change_models, model_name=="PC_ARU" & sp_english %notin% mod_ss$sp_english )
+  )
+
+
+
+d_change <-
+  d_change_models |>
+  bind_rows(
+    paired |>
+      left_join(
+        distinct(d_change_models, Region_Number, Region_Name),
+        by = join_by(BCR == Region_Number)
+      ) |>
+      select(any_of(names(d_change_models)))
+  ) |>
+  mutate(
+    fc_region = factor(
+      Region_Name,
+      levels = c(
+        "Province-wide",
+        "Lower Great Lakes / St. Lawrence Plain",
+        "Temperate Mixed",
+        "Boreal Shield West",
+        "Boreal Shield East",
+        "Hudson Plains"
+      )
+    ),
+    change_group = case_when(
+       (pct_change_qlow<0&pct_change_qhigh<0)~"Decline",
+       ( pct_change_qlow<0&pct_change_qhigh>0)~"Increase",
+        TRUE~"Uncertain or no change"
+    )
+  )
+
+d_change_gr <- d_change |>
+  left_join(
+    sg,
+    by = join_by(sp_english)
+  ) |>
+  replace_na(list(Group = "None"))
+
+
+plot_spp <- function(df) {
+  df |>
+    ggplot(aes(sp_english, pct_change_median)) +
+    geom_hline(yintercept = 0, linetype = 2) +
+    # geom_line(aes(group = sp_english), alpha = 0.2)
+    geom_pointrange(
+      aes(
+        ymin = pct_change_qlow,
+        ymax = pct_change_qhigh,
+        # colour = model_name
+      ),
+      position = position_dodge(width = 0.3)
+    ) +
+    theme_minimal() +
+    scale_x_discrete(guide = guide_axis(angle = 45)) +
+    labs(y = "Median % Change between atlas 2 and 3", x = NULL) +
+    facet_wrap(~Group)
+}
+```
+
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+d_change_gr |>
+  filter(Region_Name == "Province-wide") |>
+  ggplot(aes(Group, pct_change_median)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  # geom_line(aes(group = sp_english), alpha = 0.2)
+  # geom_point() +
+  stat_summary(
+    fun.data = 'mean_cl_boot',
+    position = position_dodge(width = 0.3)
+  ) +
+
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  geom_text(data =d_change_gr |>
+  filter(Region_Name == "Province-wide") |>
+  count(Group), aes(Group, 200, label = n) )
+```
+
+
+```{r}
+d_change_gr |>
+  filter(Region_Name == "Province-wide") |>
+  ggplot(aes(Group, pct_change_median)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+ geom_pointrange(aes(ymin=pct_change_qlow ,ymax= pct_change_qhigh),
+ position=position_jitter(width=0.2, height=0)) +
+
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  labs(y = "Median % Change between atlas 2 and 3") 
+```
+
+```{r}
+#| fig-width: 12
+#| fig-height: 8
+
+d_change_gr |>
+  filter(Region_Name != "Province-wide") |>
+  ggplot(aes(Group, pct_change_median)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  # geom_line(aes(group = sp_english), alpha = 0.2)
+  # geom_point() +
+  stat_summary(
+    fun.data = 'mean_cl_boot',
+    position = position_dodge(width = 0.3)
+  ) +
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 45)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  facet_wrap(~Region_Name, scales = 'free_x', nrow=1) +
+  theme(legend.position = c(0.8, 0.1)) +
+  coord_cartesian(ylim = c(-50, 100), clip = 'off')
+```
+
+
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+d_change_gr |>
+  filter(Region_Name == "Province-wide" & Group == "Grassland Birds") |>
+  plot_spp()
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+d_change_gr |>
+  filter(Region_Name == "Province-wide" & Group == "Shorebirds") |>
+  plot_spp()
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+d_change_gr |>
+  filter(Region_Name == "Province-wide" & Group == "None") |>
+  plot_spp()
+```
+
+
+
+```{r}
+#| fig-height: 12
+#| fig-width: 12
+
+d_change_gr |>
+  filter(Region_Name != "Province-wide" & Group == "Aerial Insectivores" & str_detect(model_name, "Paired", negate=T)) |>
+  plot_spp() +
+  facet_grid(fc_region ~ Group, scale='free_y') 
+```
+
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+dmm <-
+  d_change[d_change$Region_Name == "Province-wide", ] |>
+  summarize(mean_mean = mean(pct_change_median, na.rm = T), .by = sp_english) |>
+  mutate(spp_gr = forcats::fct_reorder(sp_english, mean_mean))
+
+
+d_change |>
+  left_join(dmm) |>
+  filter(mean_mean < -25 & Region_Name == "Province-wide") |>
+  ggplot(aes(spp_gr, pct_change_median)) +
+  geom_hline(yintercept=0, linetype=2) +
+  geom_pointrange(
+    aes(
+      ymin = pct_change_qlow,
+      ymax = pct_change_qhigh,
+      colour = model_name
+    ),
+    position = position_dodge(width = 0.3)
+  ) +
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 75)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  facet_wrap(~Region_Name, scales = 'free_x') +
+  theme(legend.position = c(0.8, 0.1)) #+
+#  coord_cartesian(ylim=c(-100,25), clip = 'off')
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+d_change |>
+  left_join(dmm) |>
+  filter(mean_mean >= -25 &mean_mean <0 & Region_Name == "Province-wide") |>
+  ggplot(aes(spp_gr, pct_change_median)) +
+  geom_hline(yintercept=0, linetype=2) +
+  geom_pointrange(
+    aes(
+      ymin = pct_change_qlow,
+      ymax = pct_change_qhigh,
+      colour = model_name
+    ),
+    position = position_dodge(width = 0.3)
+  ) +
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 75)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  facet_wrap(~Region_Name, scales = 'free_x') +
+  theme(legend.position = c(0.8, 0.1)) #+
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+d_change |>
+  left_join(dmm) |>
+  filter(Region_Name == "Boreal Shield East") |>
+  mutate(mean_mean = mean(pct_change_median, na.rm = T), .by = sp_english) |>
+  mutate(spp_gr = forcats::fct_reorder(sp_english, mean_mean)) |>
+  filter(mean_mean < -25) |>
+  distinct(
+    spp_gr,
+    pct_change_median,
+    pct_change_qlow,
+    pct_change_qhigh,
+    model_name,
+    Region_Name
+  ) |>
+  ggplot(aes(spp_gr, pct_change_median)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_pointrange(
+    aes(
+      ymin = pct_change_qlow,
+      ymax = pct_change_qhigh,
+      colour = model_name
+    ),
+    position = position_dodge(width = 0.5)
+  ) +
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 75)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  facet_wrap(~Region_Name, scales = 'free_y', nrow = 3) +
+  theme(legend.position = 'bottom') +
+  coord_cartesian(ylim = c(-100, 100), clip = 'off')
+```
+
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| eval:: false
+d_change |>
+  left_join(dmm) |>
+  # filter( Region_Name=="Boreal Shield East") |>
+  filter(model_name == "PC_ARU_CL") |>
+  #   mutate(mean_mean = mean(pct_change_median, na.rm=T), .by = sp_english) |>
+  #  mutate(spp_gr = forcats::fct_reorder(sp_english,mean_mean)) |>
+  filter(mean_mean < -25) |>
+  distinct(
+    spp_gr,
+    pct_change_median,
+    pct_change_qlow,
+    pct_change_qhigh,
+    model_name,
+    Region_Name
+  ) |>
+  mutate(
+    fc_region = factor(
+      Region_Name,
+      levels = c(
+        "Province-wide",
+        "Lower Great Lakes / St. Lawrence Plain",
+        "Temperate Mixed",
+        "Boreal Shield West",
+        "Boreal Shield East",
+        "Hudson Plains"
+      )
+    )
+  ) |>
+  ggplot(aes(fc_region, pct_change_median)) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  geom_line(aes(group = spp_gr)) +
+  # geom_ribbon(
+  #     aes(
+  #       ymin = pct_change_qlow,
+  #       ymax = pct_change_qhigh,
+  #       group = spp_gr
+  #     ),
+  #     position = position_dodge(width = 0.5)
+  #   ) +
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 75)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  # facet_wrap(~Region_Name, scales = 'free_y', nrow = 3) +
+  theme(legend.position = 'bottom') +
+  coord_cartesian(ylim = c(-100, 100), clip = 'off')
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| eval: false
+d_change_gr |>
+  filter(model_name == "PC_ARU_CL") |>
+  mutate(
+    fc_region = factor(
+      Region_Name,
+      levels = c(
+        "Province-wide",
+        "Lower Great Lakes / St. Lawrence Plain",
+        "Temperate Mixed",
+        "Boreal Shield West",
+        "Boreal Shield East",
+        "Hudson Plains"
+      )
+    )
+  ) |>
+  ggplot(aes(fc_region, pct_change_median, group = Group)) +
+  stat_summary(
+    # fun.data = 'mean_cl_boot',
+    fun = 'mean',
+    geom = 'line',
+    position = position_dodge(width = 0.3)
+  ) +
+  theme_minimal() +
+  scale_x_discrete(guide = guide_axis(angle = 75)) +
+  labs(y = "Median % Change between atlas 2 and 3") +
+  # facet_wrap(~Region_Name, scales = 'free_y', nrow = 3) +
+  theme(legend.position = 'bottom') #+
+# coord_cartesian(ylim = c(-100, 100), clip = 'off')
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| eval: false
+d_change |>
+  filter(model_name == "PC_ARU") |>
+  select(fc_region, sp_english, pct_change_median) |>
+  pivot_wider(names_from = fc_region, values_from = pct_change_median) |>
+  filter(`Lower Great Lakes / St. Lawrence Plain` < 0 & `Hudson Plains` > 0) |>
+  pull(sp_english)
+
+```
+
+```{r}
+
+
+gen_dist <- function(spp_code, model_name) {
+  # browser()
+  f_ <- list.files(
+    glue::glue(
+      "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/rasters_{model_name}/"
+    ),
+    glue::glue("^{spp_code}_a\\d.tif"),
+    full.names = T
+  )
+  if (length(f_) == 0) {
+    return(NULL)
+  }
+  r <- terra::rast(f_)
+
+  cent_ <- r |>
+    terra::centroids(weighted = T)
+  cents_sf <-
+    cent_ |>
+    mutate(
+      lyr = names(r),
+      atlas = rep(str_extract(f_, "a2|a3"), each = 2),
+      species = spp_code
+    ) |>
+    st_as_sf(coords = c("x", "y"), crs = terra::crs(r), remove = F) |>
+    filter(lyr == "mu_q50") |>
+    mutate(model_name = model_name)
+
+  dist_move <- cents_sf |>
+    st_transform(3161) %>%
+    st_distance(.[1, ], .[2, ]) |>
+    units::set_units('km') %>%
+    .[2, 1]
+
+  azimuth_rad <- st_transform(cents_sf, 4326) |> lwgeom::st_geod_azimuth()
+  azimuth_deg <- units::set_units(azimuth_rad, "degrees")
+
+  list(
+    change = tibble(
+      species = spp_code,
+      model_name = model_name,
+      change_deg = azimuth_deg,
+      change_rad = azimuth_rad,
+      change_dist_km = dist_move
+    ),
+    centroids = cents_sf
+  )
+}
+
+all_mods <-
+  map(
+    c("PC_ARU", "PC_ARU_CL", "PC_ARU_CL_SS"),
+    ~ {
+      rast_og <- list.files(
+        glue::glue(
+          "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/rasters_{.x}/"
+        ),
+        "_a\\d.tif"
+      )
+
+      tibble(
+        model_name = .x,
+        spp_code = str_remove_all(rast_og, "_(a2|a3).tif") |> unique()
+      )
+    }
+  ) |>
+  list_rbind()
+
+# future::plan(future::multisession(workers = 12))
+# all_spp_res <- pmap(all_mods, gen_dist) |> futurize::futurize()
+# future::plan(future::sequential())
+# write_rds(all_spp_res, "RAW_DATA/Raw_species_res_distance.rds")
+all_spp_res <-read_rds( "RAW_DATA/Raw_species_res_distance.rds")
+
+# gen_dist("blue_winged_warbler", "PC_ARU")
+
+all_dists <- all_spp_res |> transpose() |> pluck("change") |> list_rbind() |> 
+  mutate(abs_change =abs(units::drop_units(change_deg)),
+  abs_dist =  abs(units::drop_units(change_dist_km))) |> 
+    left_join(d_change[d_change$Region_Number=='province',], by = join_by(model_name, species==sp_file)) |> 
+    mutate(delta_x = sin(change_rad)* change_dist_km,
+    delta_y = cos(change_rad)* change_dist_km) |> 
+       filter( (model_name=="PC_ARU" & sp_english %notin% mod_ss$sp_english) |(model_name == "PC_ARU_CL_SS"))
+all_centroids <- all_spp_res |>
+  transpose() |>
+  pluck("centroids") |>
+  list_rbind() |> 
+  filter( (model_name=="PC_ARU" & species %notin% mod_ss$sp_file) |(model_name == "PC_ARU_CL_SS"))
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+library(units)
+ggplot() +
+  geom_vline(xintercept =  c(-90, 90), linetype=2, size =1) +
+  geom_point(
+    data=all_dists, aes( units::drop_units(change_deg), pct_change_median,
+   size = abs_dist
+  )
+  ) + #facet_wrap(~model_name) +
+    scale_size_area() 
+    # scale_colour_distiller(type = 'div' , limits = c(-100, 100)) +
+    # theme_dark()
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+all_dists |> #slice_max(change_dist_km, n=5)
+  filter(str_detect(sp_english, "Swallow|Swift")) |> 
+  # filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Aerial ")]) |> 
+ggplot()+
+  geom_segment(data = ,
+x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
+yend=units::drop_units(delta_y)), alpha =0.4) +
+  # facet_wrap(model_name~ change_group) +
+  labs(x = "Change in distribution (West to East; km)", 
+  y = "Change in distribution (North to South; km)", title ="Swallows and Swifts") +
+    theme_minimal() 
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+all_dists |> #slice_max(change_dist_km, n=5)
+  # filter(str_detect(sp_english, "Swallow|Swift")) |> 
+  filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Aerial ")]) |> 
+ggplot()+
+  geom_segment(data = ,
+x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
+yend=units::drop_units(delta_y)), alpha =0.4) +
+  # facet_wrap(model_name~ change_group) +
+  labs(x = "Change in distribution (West to East; km)", 
+  y = "Change in distribution (North to South; km)", title ="Aerial Insectivores") +
+    theme_minimal() 
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+dist_shore <- all_dists |> #slice_max(change_dist_km, n=5)
+  # filter(str_detect(sp_english, "Swallow|Swift")) |> 
+  filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Shorebirds")])  
+ggplot()+
+  geom_segment(data =dist_shore,
+x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
+yend=units::drop_units(delta_y)), alpha =0.4) +
+  # facet_wrap(model_name~ change_group) +
+  ggrepel::geom_text_repel(
+    data = dist_shore[dist_shore$abs_dist>100,],
+    aes(x = units::drop_units(delta_x), 
+    y = units::drop_units(delta_y), label = sp_english)) +
+  labs(x = "Change in distribution (West to East; km)", 
+  y = "Change in distribution (North to South; km)", title ="Shorebirds") +
+    theme_minimal() 
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+dist_grass <- all_dists |> #slice_max(change_dist_km, n=5)
+  # filter(str_detect(sp_english, "Swallow|Swift")) |> 
+  filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Grassland")])  
+ggplot()+
+  geom_segment(data =dist_grass,
+x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
+yend=units::drop_units(delta_y)), alpha =0.4) +
+  # facet_wrap(model_name~ change_group) +
+  ggrepel::geom_text_repel(
+    data = dist_grass[dist_grass$abs_dist>50,],
+    aes(x = units::drop_units(delta_x), 
+    y = units::drop_units(delta_y), label = sp_english)) +
+  labs(x = "Change in distribution (West to East; km)", 
+  y = "Change in distribution (North to South; km)", title ="Grassland birds") +
+    theme_minimal() 
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+# all_dists |> left_join(all_centroids[all_centroids$atlas=="a2",],by = join_by(species, model_name) ) 
+
+devtools::source_gist(id="https://gist.github.com/johnbaums/24478656055c48e24bc4393ac782a4e3", filename = 'sf_arrow.R')
+
+dat_arrow <- 
+sf_arrow(all_centroids[all_centroids$atlas=='a2',], 
+all_centroids[all_centroids$atlas=='a3',], len = 3e4, deg = 45) |> 
+  left_join(all_dists |> select(species, model_name, abs_dist), 
+  by = join_by( from.species==species, from.model_name==model_name))
+
+# dat_arrow |> 
+#   filter(from.species!=to.species | from.model_name !=to.model_name)
+
+show_arrows <- dat_arrow |> 
+  # filter(from.model_name=="PC_ARU_CL"  
+  # ) |> 
+  slice_max(abs_dist, n=10)
+
+ggplot() + 
+  geom_sf(data = BASSr::ontario) +
+
+  ggrepel::geom_label_repel(data = all_centroids[all_centroids$atlas=='a2' & all_centroids$species %in% show_arrows$from.species ,],
+   aes(label = species, geometry = geometry),
+  stat = 'sf_coordinates') +  geom_sf(data =show_arrows)  +
+    ggthemes::theme_map()
+  # arrow=arrow(type = "closed", length = unit(0.02, "npc")) )
+# annotate("segment", x = 87.5, y = 110, xend = 87.5, yend = 98,
+#          arrow = arrow(type = "closed", length = unit(0.02, "npc")))
+
+# all_dists |>
+#   filter(
+#     abs(units::drop_units(change_deg))>=90
+#   ) |> arrange(desc(abs_change))
+
+# ggplot(all_centroids[all_centroids$species == "great_egret", ]) +
+#   geom_sf(aes(colour = atlas, shape = model_name), size =5) +
+#   geom_sf(data = BASSr::ontario, fill = NA)
+
+```
+
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| eval: false
+comp_mod_dist <- 
+all_dists |> select(species, model_name, abs_dist) |> 
+  #   dplyr::mutate(n = dplyr::n(), .by = c(species, model_name)) |>
+  # dplyr::filter(n > 1L) |> glimpse()
+  pivot_wider(names_from = model_name, values_from =abs_dist)  |> 
+    filter(!is.na(species))
+    # filter(is.na(PC_ARU))
+    ggplot() +
+      geom_abline(slope = 1, intercept = 0, linetype=2) +
+    geom_point(data=comp_mod_dist, 
+    aes(PC_ARU, PC_ARU_CL)) +
+    ggrepel::geom_text_repel(data =comp_mod_dist[(!is.na(comp_mod_dist$PC_ARU) &comp_mod_dist$PC_ARU>200),],
+  aes(PC_ARU, PC_ARU_CL, label = species) ) +
+    theme_minimal() +
+    labs(title = "Change in absolute distance (km)")
+```
+
+```{r}
+#| fig-width: 10
+#| fig-height: 8
+#| eval: false
+    ggplot() +
+      geom_abline(slope = 1, intercept = 0, linetype=2) +
+    geom_point(data=comp_mod_dist |> filter(!is.na(PC_ARU_CL_SS)), 
+    aes( PC_ARU_CL,PC_ARU_CL_SS)) +
+    ggrepel::geom_text_repel(data =comp_mod_dist[(!is.na(comp_mod_dist$PC_ARU_CL_SS) &comp_mod_dist$PC_ARU_CL_SS>10),],
+  aes( PC_ARU_CL,PC_ARU_CL_SS, label = species) ) +
+    theme_minimal() +
+    labs(title = "Change in absolute distance (km)")
+
+
+# d_change |> filter(sp_file=="blue_winged_warbler" & model_name=='PC_ARU'&region_type=='province')
+
+
+
+
+
+
+
+```

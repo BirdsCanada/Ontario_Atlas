@@ -1,0 +1,3373 @@
+# ============================================================
+# model_product_utils.R
+#
+# Purpose
+#   Utility functions for generating model products from fitted
+#   OBBA abundance/change models. Functions cover rasterization,
+#   relative-abundance maps, hex-level change summaries, and
+#   model-assessment panels comparing predictions with observations.
+#
+# Documentation style
+#   Function comments are intentionally plain comments rather than
+#   ROxygen comments, because this script is sourced directly rather
+#   than built as an R package.
+#
+# Contents
+#   Species-invariant indices (build once, reuse for every species)
+#     build_raster_index, rasterize_from_index, build_region_raster_index,
+#     clip_to_region_mask, add_region_survey_index, subset_region_surveys,
+#     make_step_timer
+#   Rasterization & scaling
+#     resolve_positive_max, resolve_rast_max, compute_assessment_scale_limits,
+#     prepare_relative_abundance_rasters, prepare_change_raster
+#   Safe-date trimming and probability of observation
+#     grid_region_lookup, trim_predictions_to_safe_dates, marginal_pobs,
+#     nb_size_from_hyper   (iid variances come from get_var() in inla_model_utils.R)
+#   Maps
+#     make_map, plot_raster_gg
+#   Hex-level change summaries & maps
+#     summarize_hex_draw_change, compute_hex_polygon_weights,
+#     change_draw_summary, summarize_hex_draws_by_region,
+#     classify_min_supported_change, get_min_supported_change_scale,
+#     make_min_supported_change_legend, make_hex_abs_change_map
+#   Region assessment core
+#     assess_region, summarize_hex, join_surveys_to_hex,
+#     summarize_surveys_by_hex, summarize_special_by_hex,
+#     extract_hex_predictions, compute_region_stats
+#   Panel plot helpers
+#     survey_detection_counts, plot_honeycomb, make_effort_classes,
+#     make_change_comparison_plot, make_paired_summary_table
+#   Per-region / per-page assembly
+#     make_region_geom, load_species_surveys, prepare_honeycomb_surveys,
+#     honeycomb_size_label, require_bcr_key, build_period_assessments,
+#     build_period_honeycombs, save_page, save_pdf_pages
+#
+# Sourced by 08 and 09 (09 also sources spatial_utils.R for make_hex_grid() and
+# inla_model_utils.R for get_var()).
+# ============================================================
+
+
+# ------------------------------------------------------------
+# Extract a pixel_id -> Biol_Region lookup from one prediction grid.
+#
+# grid        dat$grid_OBBA2 or dat$grid_OBBA3 (an sf carrying pixel_id, hex_id
+#             and Biol_Region, all written by 06).
+# region_col  Region-label column (default "Biol_Region").
+#
+# Returns a plain data.frame(pixel_id, hex_id, Biol_Region) -- no geometry, no
+# spatial ops. Fails loudly if the grid lacks 06's Biol_Region tagging.
+# ------------------------------------------------------------
+grid_region_lookup <- function(grid, region_col = "Biol_Region") {
+  
+  stopifnot(inherits(grid, "sf") || is.data.frame(grid))
+  
+  needed  <- c("pixel_id", "hex_id", region_col)
+  missing <- setdiff(needed, names(grid))
+  if (length(missing) > 0) {
+    stop("grid_region_lookup(): grid is missing ", paste(missing, collapse = ", "),
+         ". Re-run 06_filter_and_finalize_surveys.R so the saved grids carry ",
+         "pixel_id, hex_id and ", region_col, ".", call. = FALSE)
+  }
+  
+  g <- sf::st_drop_geometry(grid)
+  data.frame(
+    pixel_id    = g$pixel_id,
+    hex_id      = g$hex_id,
+    Biol_Region = as.character(g[[region_col]]),
+    stringsAsFactors = FALSE
+  )
+}
+
+
+# ------------------------------------------------------------
+# Zero every prediction product for regions the species has no safe dates in.
+#
+# preds                  One prediction record (readRDS of a 07 output file).
+# lookup_obba2           grid_region_lookup(dat$grid_OBBA2).
+# lookup_obba3           grid_region_lookup(dat$grid_OBBA3).
+# safe_regions           Regions WITH safe dates. NULL -> derived from
+#                        preds$sp_safe_dates: the regions whose start_doy/end_doy
+#                        are non-NA. preds$sp_safe_dates is the ORIGINAL
+#                        (unmodified) table written by 06/07, which lists EVERY
+#                        region with NA windows where the species has no safe
+#                        dates -- so safety is judged by the window, not by the
+#                        mere presence of a Biol_Region row.
+# hex_no_safe_threshold  A hexagon is zeroed when this FRACTION (or more) of its
+#                        pixels fall in no-safe-date regions. 0.5 = majority
+#                        (default). Set 0 to zero a hex if ANY pixel is no-safe;
+#                        set ~1 to zero only hexes lying entirely in no-safe
+#                        regions.
+# trim_unclassified      TRUE also zeros pixels/hexes with region = NA. FALSE
+#                        (default) keeps them. Moot in practice, since 06 tags
+#                        the grid with nearest_fallback = TRUE (no NA regions);
+#                        retained as a guard against a stale grid.
+#
+# Returns preds with OBBA2/OBBA3/abs_change pixel summaries and hex_draws (both
+# plain and _Corrected_for_Water) zeroed in place.
+# ------------------------------------------------------------
+trim_predictions_to_safe_dates <- function(preds,
+                                           lookup_obba2,
+                                           lookup_obba3,
+                                           safe_regions          = NULL,
+                                           hex_no_safe_threshold = 0.5,
+                                           trim_unclassified     = FALSE,
+                                           verbose               = TRUE) {
+  
+  # ---- Resolve the species' safe-date regions ----
+  # A region counts as "safe" for this species only if it has a DEFINED safe-date
+  # window. preds$sp_safe_dates lists every region, with NA start/end where the
+  # species has no safe dates -- those NA-window regions are exactly the ones to
+  # zero here, so select on the window, not merely on a non-NA Biol_Region label.
+  if (is.null(safe_regions)) {
+    ssd <- preds$sp_safe_dates
+    if (is.null(ssd) || !"Biol_Region" %in% names(ssd)) {
+      stop("trim_predictions_to_safe_dates(): safe_regions not supplied and ",
+           "preds$sp_safe_dates$Biol_Region is unavailable.", call. = FALSE)
+    }
+    if (all(c("start_doy", "end_doy") %in% names(ssd))) {
+      has_window   <- !is.na(ssd$start_doy) & !is.na(ssd$end_doy)
+      safe_regions <- ssd$Biol_Region[has_window]
+    } else {
+      # Record without window columns: treat every listed region as safe.
+      safe_regions <- ssd$Biol_Region
+    }
+  }
+  safe_regions <- unique(as.character(safe_regions))
+  safe_regions <- safe_regions[!is.na(safe_regions)]
+  
+  # No safe-date table at all -> leave predictions untouched.
+  if (length(safe_regions) == 0) {
+    if (verbose) message("  safe-date trim: no safe regions listed; ",
+                         "predictions left unchanged.")
+    return(preds)
+  }
+  
+  # ---- Guard against a Biol_Region label mismatch ----
+  # Grid and safe-date labels both descend from Biol_Regions_ON, so this should
+  # never fire; but if NONE of the safe regions match the grid labels, a naive
+  # %in% would flag EVERY pixel as no-safe and erase the whole surface. Stop.
+  grid_regions <- unique(c(lookup_obba2$Biol_Region, lookup_obba3$Biol_Region))
+  grid_regions <- grid_regions[!is.na(grid_regions)]
+  if (length(intersect(safe_regions, grid_regions)) == 0) {
+    stop("trim_predictions_to_safe_dates(): none of the species' safe-date ",
+         "regions match the Biol_Region labels on the prediction grid.\n",
+         "  safe_regions: ", paste(safe_regions, collapse = ", "), "\n",
+         "  grid regions: ", paste(sort(grid_regions), collapse = ", "), "\n",
+         "This is almost certainly a Biol_Region label mismatch; refusing to ",
+         "zero the whole surface.", call. = FALSE)
+  }
+  
+  # ---- Per-pixel keep flag for a summary (matched by pixel_id, order-safe) ----
+  pixel_keep <- function(pixel_ids, lookup) {
+    region       <- lookup$Biol_Region[match(pixel_ids, lookup$pixel_id)]
+    keep         <- region %in% safe_regions
+    unclassified <- is.na(region)
+    if (any(unclassified)) keep[unclassified] <- !trim_unclassified
+    keep
+  }
+  
+  # ---- Zero a pixel-summary data.frame in place ----
+  zero_pixel_summary <- function(df, prefix, lookup) {
+    if (is.null(df)) return(df)
+    if (!"pixel_id" %in% names(df)) {
+      stop("trim: summary for prefix '", prefix, "' has no pixel_id column.",
+           call. = FALSE)
+    }
+    drop <- !pixel_keep(df$pixel_id, lookup)
+    if (!any(drop)) return(df)
+    
+    val_cols  <- grep(paste0("^", prefix, "_"), names(df), value = TRUE)
+    cv_cols   <- grep(paste0("^", prefix, "_cv"), names(df), value = TRUE)
+    zero_cols <- setdiff(val_cols, cv_cols)
+    
+    for (cc in zero_cols) df[[cc]][drop] <- 0            # abundance / change -> 0
+    for (cc in cv_cols)   df[[cc]][drop] <- NA_real_     # CV undefined at 0
+    df
+  }
+  
+  # ---- Per-hex no-safe fraction, from the OBBA2 grid (hex_draws' provenance) ----
+  reg   <- lookup_obba2$Biol_Region
+  nsafe <- !(reg %in% safe_regions)
+  nsafe[is.na(reg)] <- isTRUE(trim_unclassified)
+  hex_frac <- tapply(nsafe, lookup_obba2$hex_id, function(z) mean(z, na.rm = TRUE))
+  
+  # ---- Zero the draw vectors of no-safe hexes in place (length preserved) ----
+  zero_hex_draws <- function(hd) {
+    if (is.null(hd) || nrow(hd) == 0) return(hd)
+    f <- hex_frac[as.character(hd$hex_id)]
+    f[is.na(f)] <- 0                       # hex absent from lookup -> keep
+    drop <- f >= hex_no_safe_threshold
+    if (!any(drop)) return(hd)
+    
+    for (j in which(drop)) {
+      hd$mu_OBBA2[[j]] <- numeric(length(hd$mu_OBBA2[[j]]))
+      hd$mu_OBBA3[[j]] <- numeric(length(hd$mu_OBBA3[[j]]))
+      if ("abs_change" %in% names(hd)) {
+        hd$abs_change[[j]] <- numeric(length(hd$abs_change[[j]]))
+      }
+    }
+    hd
+  }
+  
+  # ---- Apply to every product variant ----
+  # OBBA2 and abs_change carry the OBBA2 grid's pixel_id; OBBA3 the OBBA3 grid's.
+  preds$OBBA2      <- zero_pixel_summary(preds$OBBA2,      "OBBA2",      lookup_obba2)
+  preds$OBBA3      <- zero_pixel_summary(preds$OBBA3,      "OBBA3",      lookup_obba3)
+  preds$abs_change <- zero_pixel_summary(preds$abs_change, "abs_change", lookup_obba2)
+  
+  preds$OBBA2_Corrected_for_Water <-
+    zero_pixel_summary(preds$OBBA2_Corrected_for_Water, "OBBA2", lookup_obba2)
+  preds$OBBA3_Corrected_for_Water <-
+    zero_pixel_summary(preds$OBBA3_Corrected_for_Water, "OBBA3", lookup_obba3)
+  preds$abs_change_Corrected_for_Water <-
+    zero_pixel_summary(preds$abs_change_Corrected_for_Water, "abs_change", lookup_obba2)
+  
+  preds$hex_draws <- zero_hex_draws(preds$hex_draws)
+  preds$hex_draws_Corrected_for_Water <-
+    zero_hex_draws(preds$hex_draws_Corrected_for_Water)
+  
+  if (verbose) {
+    n_reg_trim <- length(setdiff(grid_regions, safe_regions))
+    n_hex_trim <- sum(hex_frac >= hex_no_safe_threshold, na.rm = TRUE)
+    message("  safe-date trim: ", n_reg_trim, " region(s) without safe dates -> ",
+            n_hex_trim, " hexagon(s) zeroed (threshold ",
+            hex_no_safe_threshold, ").")
+  }
+  
+  preds
+}
+
+# Marginal per-survey probability of observation.
+# Converts a median-square expected-count surface (geometric-mean lambda, i.e.
+# the iid terms held at 0, as make_pred_formula_multiatlas() predicts) into the
+# probability that a single 5-min count at a RANDOM square in the pixel's
+# neighbourhood detects the species:
+#
+#   PObs = E_z[ 1 - P0( lambda * exp(z) ) ],   z ~ N(0, sigma2_omit)
+#     P0_poisson(m) = exp(-m)
+#     P0_nbinom(m)  = (size / (size + m))^size
+#
+# Integrating z reinstates the omitted log-normal heterogeneity (raising PObs
+# where lambda is small, since detection is concave in a right-skewed density);
+# the family-correct P0 stops the Poisson formula overstating detection in the
+# nbinomial core. sigma2_omit = 0 and size = Inf recover 1 - exp(-lambda).
+#
+# lambda_rast  single-layer SpatRaster of median-square expected counts
+#              (e.g. r2[["mu_q50"]]). NA preserved; lambda <= 0 -> PObs 0.
+# sigma2_omit  total log-scale variance of the omitted iid terms (>= 0).
+# size         nbinomial size; Inf for a Poisson-fitted species.
+# n_nodes      Gaussian integration nodes (odd; 41 is ample for this integrand).
+# n_surveys    Number of independent surveys to represent PObs for
+marginal_pobs <- function(lambda_rast,
+                          sigma2_omit = 0,
+                          size = Inf,
+                          n_nodes = 41L,
+                          n_surveys = 1L) {
+  
+  stopifnot(
+    inherits(lambda_rast, "SpatRaster"),
+    terra::nlyr(lambda_rast) == 1L
+  )
+  stopifnot(
+    is.finite(sigma2_omit),
+    sigma2_omit >= 0,
+    n_nodes >= 1L,
+    n_surveys >= 1L
+  )
+  
+  P0 <- if (is.finite(size)) {
+    function(m) (size / (size + m))^size
+  } else {
+    function(m) exp(-m)
+  }
+  
+  lam <- terra::values(lambda_rast, mat = FALSE)
+  
+  out <- rep(NA_real_, length(lam))
+  out[is.finite(lam) & lam <= 0] <- 0
+  ok <- is.finite(lam) & lam > 0
+  
+  if (any(ok)) {
+    
+    l <- lam[ok]
+    
+    if (sigma2_omit <= 0) {
+      
+      # Marginal probability of detection on ONE survey
+      p_single <- 1 - P0(l)
+      
+    } else {
+      
+      sigma <- sqrt(sigma2_omit)
+      z <- seq(-6, 6, length.out = n_nodes)
+      
+      w <- stats::dnorm(z)
+      w <- w / sum(w)
+      
+      p_single <- numeric(length(l))
+      
+      for (j in seq_along(z)) {
+        p_single <- p_single +
+          w[j] * (1 - P0(l * exp(sigma * z[j])))
+      }
+    }
+    
+    # Probability of >=1 detection across n independent surveys
+    out[ok] <- 1 - (1 - p_single)^n_surveys
+  }
+  
+  r <- terra::setValues(lambda_rast, out)
+  names(r) <- paste0("PObs_", n_surveys, "_surveys")
+  
+  r
+}
+
+# Median nbinomial size (dispersion) from a summary.hyperpar table; Inf for a
+# Poisson-fitted species (no size row).
+nb_size_from_hyper <- function(hyper, quantile = "0.5quant") {
+  if (is.null(hyper) || is.null(rownames(hyper))) return(Inf)
+  i <- grep("size for the nbinomial", rownames(hyper), fixed = TRUE)
+  if (length(i) == 0L || !quantile %in% colnames(hyper)) return(Inf)
+  s <- hyper[i[1L], quantile]
+  if (!is.finite(s) || s <= 0) Inf else s
+}
+
+# ------------------------------------------------------------
+# Shared constants
+# ------------------------------------------------------------
+
+# Per-panel plot margin reused across composed assessment figures.
+margin_theme <- ggplot2::theme(plot.margin = ggplot2::margin(5, 10, 5, 10))
+
+# ------------------------------------------------------------
+# Species-invariant spatial indices (built ONCE per script run)
+#
+# The prediction grid, hex grids, region polygons and survey locations are the
+# same for every species, so every geometric operation on them can be done once
+# and replaced per species by vector indexing. These helpers produce results
+# identical to the per-species geometry they replace.
+# ------------------------------------------------------------
+
+# Map raster cells of a template to the rows of a prediction grid.
+#
+# Built once per run so each species' rasters are filled by vector indexing.
+# Polygons: each cell takes the polygon covering its centre (as
+# terra::rasterize); points: rows sharing a cell are averaged (as
+# terra::rasterize(fun = mean, na.rm = TRUE)).
+#
+# Returns list(template, cell, row, n_rows, multi) for rasterize_from_index().
+build_raster_index <- function(grid_sf, res) {
+  stopifnot(inherits(grid_sf, "sf"))
+
+  g <- sf::st_sf(row = seq_len(nrow(grid_sf)), geometry = sf::st_geometry(grid_sf))
+  v <- terra::vect(g)
+  template <- terra::rast(v, res = res)
+
+  if (terra::geomtype(v) == "points") {
+    idx <- data.frame(cell = terra::cellFromXY(template, terra::crds(v)), row = g$row)
+  } else {
+    r_row <- terra::values(terra::rasterize(v, template, field = "row"), mat = FALSE)
+    keep  <- which(!is.na(r_row))
+    idx   <- data.frame(cell = keep, row = r_row[keep])
+  }
+  idx <- idx[!is.na(idx$cell), ]
+
+  list(template = template, cell = idx$cell, row = idx$row,
+       n_rows = nrow(g), multi = anyDuplicated(idx$cell) > 0)
+}
+
+# Fill a multi-layer raster from grid-row-aligned value vectors using an index
+# from build_raster_index().
+#
+# values   Named list of numeric vectors, each of length nrow(grid); names
+#          become layer names.
+# metadata Named character vector of metadata tags.
+rasterize_from_index <- function(index, values, metadata = NULL) {
+  stopifnot(is.list(values), !is.null(names(values)))
+  if (any(lengths(values) != index$n_rows)) {
+    stop("rasterize_from_index(): value vectors must have length ", index$n_rows,
+         " (one per grid row).", call. = FALSE)
+  }
+
+  n_cell <- terra::ncell(index$template)
+
+  fill_one <- function(x) {
+    out <- rep(NA_real_, n_cell)
+    x   <- as.numeric(x)[index$row]
+    if (index$multi) {
+      ok <- !is.na(x)
+      s  <- rowsum(x[ok], index$cell[ok])
+      n  <- rowsum(rep(1, sum(ok)), index$cell[ok])
+      out[as.integer(rownames(s))] <- s[, 1] / n[, 1]
+    } else {
+      out[index$cell] <- x
+    }
+    out
+  }
+
+  r <- terra::rast(index$template, nlyrs = length(values))
+  terra::values(r) <- vapply(values, fill_one, numeric(n_cell))
+  names(r) <- names(values)
+  if (!is.null(metadata)) terra::metags(r) <- metadata
+  r
+}
+
+# Region mask raster and hex -> cell lookup for one assessment region.
+#
+# mask       template cropped to the region, 1 inside / NA outside. Used by
+#            clip_to_region_mask() in place of crop() + mask() by polygon.
+# hex_cells  data.frame(hex_id, cell): cells of `mask` whose centres fall in
+#            each hex -- the same cells terra::extract(fun = mean) averages in
+#            extract_hex_predictions().
+build_region_raster_index <- function(template, region_geom, hex_grid) {
+  crs_r       <- terra::crs(template)
+  region_vect <- terra::vect(sf::st_transform(region_geom, crs_r))
+
+  mask <- terra::init(template, 1) |>
+    terra::crop(region_vect) |>
+    terra::mask(region_vect)
+
+  ex <- terra::extract(mask, terra::vect(sf::st_transform(hex_grid, crs_r)),
+                       cells = TRUE)
+
+  list(mask      = mask,
+       hex_cells = data.frame(hex_id = hex_grid$hex_id[ex$ID], cell = ex$cell))
+}
+
+# Crop + mask a raster to a precomputed region mask (raster-raster; fast).
+clip_to_region_mask <- function(rast, mask) {
+  terra::mask(terra::crop(rast, mask), mask)
+}
+
+# Survey -> region membership and region-hex id, for every region at once.
+#
+# Adds, per region spec, a logical column spec$index$in_col (survey intersects
+# the region, as sf::st_filter) and an integer column spec$index$hex_col (the
+# region hex the survey lies within, as st_join(join = st_within); NA if none).
+# Computed once on all_surveys; species subsets inherit the columns via
+# load_species_surveys().
+add_region_survey_index <- function(surveys, region_specs) {
+  for (spec in region_specs) {
+    geom   <- sf::st_transform(spec$geom, sf::st_crs(surveys))
+    in_reg <- lengths(sf::st_intersects(surveys, geom)) > 0
+
+    hex    <- sf::st_transform(spec$hex, sf::st_crs(surveys))
+    within <- sf::st_within(surveys[in_reg, ], hex)
+    first  <- vapply(within, function(w) if (length(w)) w[1] else NA_integer_,
+                     integer(1))
+
+    hex_id         <- rep(NA_integer_, nrow(surveys))
+    hex_id[in_reg] <- hex$hex_id[first]
+
+    surveys[[spec$index$in_col]]  <- in_reg
+    surveys[[spec$index$hex_col]] <- hex_id
+  }
+  surveys
+}
+
+# Subset surveys to one region using the precomputed index columns, and expose
+# the region's hex id as `.hex_id` for summarize_surveys_by_hex(hex_col = ).
+subset_region_surveys <- function(dat, region_index) {
+  if (is.null(dat)) return(NULL)
+  out <- dat[dat[[region_index$in_col]] %in% TRUE, ]
+  out$.hex_id <- out[[region_index$hex_col]]
+  out
+}
+
+# Per-step timer for the species loop: tick("label") logs the seconds since
+# the previous tick. Returns a no-op when disabled.
+make_step_timer <- function(enabled = TRUE) {
+  t0 <- Sys.time()
+  function(label) {
+    if (!isTRUE(enabled)) return(invisible(NULL))
+    t1 <- Sys.time()
+    message(sprintf("    %-30s %7.1f s", label,
+                    as.numeric(difftime(t1, t0, units = "secs"))))
+    t0 <<- t1
+    invisible(NULL)
+  }
+}
+
+
+# ------------------------------------------------------------
+# Shared plotting-scale helpers
+# ------------------------------------------------------------
+
+# Resolve a positive upper plotting/extraction limit from either an explicit
+# maximum or a quantile of positive finite values.
+#
+# Purpose:
+#   Several model-assessment panels need to use identical scaling across atlas
+#   periods. This helper centralizes the logic so a user can either supply an
+#   explicit maximum, such as 1.5 expected birds per 5-min point count, or ask
+#   for a quantile-based maximum, such as the 0.99 quantile.
+#
+# Arguments:
+#   x              Numeric vector of values used to derive the limit.
+#   max_value      Optional explicit positive maximum. If supplied, this takes
+#                  precedence over max_q.
+#   max_q          Quantile used when max_value is NULL.
+#   default        Fallback value when x has no positive finite values.
+#   argument_name  Name used in error messages.
+#
+# Returns:
+#   A single positive numeric value.
+resolve_positive_max <- function(x,
+                                 max_value = NULL,
+                                 max_q = 0.99,
+                                 default = 1,
+                                 argument_name = "max_value") {
+  
+  if (!is.null(max_value)) {
+    if (!is.numeric(max_value) || length(max_value) != 1 ||
+        !is.finite(max_value) || max_value <= 0) {
+      stop(argument_name, " must be NULL or a single positive finite number.")
+    }
+    return(as.numeric(max_value))
+  }
+  
+  if (!is.numeric(max_q) || length(max_q) != 1 ||
+      !is.finite(max_q) || max_q <= 0 || max_q > 1) {
+    stop("max_q must be a single finite number in (0, 1].")
+  }
+  
+  vals <- x[is.finite(x) & x > 0]
+  if (length(vals) == 0) return(default)
+  
+  out <- as.numeric(stats::quantile(vals, probs = max_q, na.rm = TRUE))
+  if (!is.finite(out) || out <= 0) default else out
+}
+
+# Resolve an upper relative-abundance limit from a terra SpatRaster.
+#
+# Argument: rast       SpatRaster of model predictions.
+# Argument: rast_max   Optional explicit upper limit for prediction scaling.
+# Argument: rast_max_q Quantile used when rast_max is NULL.
+# Returns: A single positive numeric value.
+resolve_rast_max <- function(rast,
+                             rast_max = NULL,
+                             rast_max_q = 0.99) {
+  stopifnot(inherits(rast, "SpatRaster"))
+  
+  resolve_positive_max(
+    x             = terra::values(rast),
+    max_value     = rast_max,
+    max_q         = rast_max_q,
+    default       = 1,
+    argument_name = "rast_max"
+  )
+}
+
+# Compute shared scale limits for model-assessment panels.
+#
+# Purpose:
+#   When producing assessment panels for multiple atlas periods, this helper can
+#   be run after creating `hex_summary` objects. The returned values can then
+#   be supplied to
+#   each call to `assess_region()` so all panels use identical scaling.
+#
+# Arguments:
+#   hex_summaries        One or more `sf` objects returned by `summarize_hex()`
+#                        or `assess_region()$hex_summary`.
+#   rasts                Optional list of SpatRaster objects used to calculate a
+#                        shared prediction limit directly from raster values.
+#   rast_max             Optional explicit shared prediction maximum.
+#   rast_max_q           Quantile used when rast_max is NULL.
+#   max_count_per_effort Optional explicit shared observed-count maximum.
+#   count_max_q          Quantile used when max_count_per_effort is NULL.
+#   max_surveys          Optional explicit shared survey-effort maximum.
+#   max_surveys_q        Quantile used when max_surveys is NULL.
+#
+# Returns:
+#   A named list with `rast_max`, `max_count_per_effort`, and `max_surveys`.
+compute_assessment_scale_limits <- function(...,
+                                            hex_summaries = list(...),
+                                            rasts = NULL,
+                                            rast_max = NULL,
+                                            rast_max_q = 0.99,
+                                            max_count_per_effort = NULL,
+                                            count_max_q = 0.99,
+                                            max_surveys = NULL,
+                                            max_surveys_q = 0.80) {
+  
+  if (length(hex_summaries) == 1 && is.list(hex_summaries[[1]]) &&
+      !inherits(hex_summaries[[1]], "sf")) {
+    hex_summaries <- hex_summaries[[1]]
+  }
+  
+  if (length(hex_summaries) == 0) {
+    stop("At least one hex_summary object must be supplied.")
+  }
+  
+  if (!all(vapply(hex_summaries, inherits, logical(1), what = "sf"))) {
+    stop("All hex_summaries must be sf objects.")
+  }
+  
+  count_values <- unlist(lapply(hex_summaries, function(x) {
+    if (!"mean_count_per_effort" %in% names(x)) {
+      stop("Each hex_summary must contain mean_count_per_effort.")
+    }
+    x$mean_count_per_effort
+  }), use.names = FALSE)
+  
+  survey_values <- unlist(lapply(hex_summaries, function(x) {
+    if (!"n_surveys" %in% names(x)) {
+      stop("Each hex_summary must contain n_surveys.")
+    }
+    x$n_surveys
+  }), use.names = FALSE)
+  
+  if (!is.null(rasts)) {
+    if (inherits(rasts, "SpatRaster")) rasts <- list(rasts)
+    if (!all(vapply(rasts, inherits, logical(1), what = "SpatRaster"))) {
+      stop("rasts must be NULL, a SpatRaster, or a list of SpatRaster objects.")
+    }
+    rast_values <- unlist(lapply(rasts, terra::values), use.names = FALSE)
+  } else {
+    rast_values <- unlist(lapply(hex_summaries, function(x) {
+      if (!"pred_mean" %in% names(x)) {
+        stop("Each hex_summary must contain pred_mean when rasts is NULL.")
+      }
+      x$pred_mean
+    }), use.names = FALSE)
+  }
+  
+  list(
+    rast_max = resolve_positive_max(
+      x             = rast_values,
+      max_value     = rast_max,
+      max_q         = rast_max_q,
+      default       = 1,
+      argument_name = "rast_max"
+    ),
+    max_count_per_effort = resolve_positive_max(
+      x             = count_values,
+      max_value     = max_count_per_effort,
+      max_q         = count_max_q,
+      default       = 1,
+      argument_name = "max_count_per_effort"
+    ),
+    max_surveys = ceiling(resolve_positive_max(
+      x             = survey_values,
+      max_value     = max_surveys,
+      max_q         = max_surveys_q,
+      default       = 1,
+      argument_name = "max_surveys"
+    ))
+  )
+}
+
+# ------------------------------------------------------------
+# Relative abundance maps
+# ------------------------------------------------------------
+
+prepare_relative_abundance_rasters <- function(...,
+                                               absent_method = c("fixed", "cumulative", "hybrid"),
+
+                                               # --- cumulative-population floor (absent_method = "cumulative") ---
+                                               # White out the low-density pixels that TOGETHER hold only the
+                                               # bottom (1 - coverage) of the predicted population, so the coloured
+                                               # area retains at least `coverage` of the birds. Population per pixel
+                                               # is density * cell area, so the floor is projection-robust rather
+                                               # than assuming an equal-area grid.
+                                               coverage         = 0.99,
+                                               coverage_basis   = c("each", "pooled"),
+                                               max_absent_limit = 1 / 500, # absolute CAP on the cumulative floor
+
+                                               # --- fixed / hybrid floor ---
+                                               rast_absent_limit    = 1 / 250,
+                                               absent_quantile      = 0.01,
+                                               relative_to_quantile = 0.99,
+                                               relative_fraction    = 0.01,
+
+                                               # --- shared upper colour limit ---
+                                               rast_max_quantile = 0.99,
+                                               rast_max = NULL) {
+  
+  rasts <- list(...)
+  absent_method  <- match.arg(absent_method)
+  coverage_basis <- match.arg(coverage_basis)
+  
+  if (length(rasts) == 0) {
+    stop("At least one raster must be supplied.")
+  }
+  
+  if (!all(vapply(rasts, inherits, logical(1), what = "SpatRaster"))) {
+    stop("All inputs passed through `...` must be terra SpatRaster objects.")
+  }
+  
+  # ------------------------------------------------------------
+  # Resolve absence floor
+  # ------------------------------------------------------------
+  # cumulative (recommended for abundance surfaces):
+  #   Rank pixels by density and white out the smallest-density pixels whose
+  #   summed POPULATION (density * cell area) is at most (1 - coverage) of the
+  #   total. The coloured area then holds >= coverage of the predicted birds.
+  #   The resulting cumulative floor is then capped at `max_absent_limit`, so the
+  #   threshold can never be more restrictive than the chosen absolute abundance
+  #   value (default 1/500 expected birds per standardized point count).
+  #   Area-weighting makes the cumulative calculation correct on any projection,
+  #   not only an equal-area grid.
+  #
+  #   coverage_basis sets how the single, cross-period floor is formed:
+  #     "each"   -> resolve the floor separately for each period and take the
+  #                 MOST INCLUSIVE (smallest), so >= coverage is retained in BOTH
+  #                 maps. A period that is nearly empty therefore pulls the shared
+  #                 floor down -- deliberate: it never erases a declining or
+  #                 colonising period's signal. Default.
+  #     "pooled" -> one floor on the concatenated pixels of all periods (>= coverage
+  #                 of the COMBINED population). Tighter maps, but the smaller
+  #                 period can drop below coverage if its density is lower.
+  #
+  # fixed:
+  #   Uses `rast_absent_limit` directly (a fixed detection-referenced density).
+  #   This is the default, so callers that threshold non-abundance surfaces
+  #   (e.g. probability-of-observation) are unaffected by the cumulative option.
+  #
+  # hybrid:
+  #   max(rast_absent_limit, low prediction quantile, small fraction of a high
+  #   prediction quantile).
+  # ------------------------------------------------------------
+  
+  # Extract finite, positive (density, cell-area) pairs from one raster.
+  dens_area <- function(r) {
+    v <- terra::values(r, mat = FALSE)
+    a <- terra::values(terra::cellSize(r, unit = "km"), mat = FALSE)
+    keep <- is.finite(v) & is.finite(a) & v > 0
+    list(v = v[keep], a = a[keep])
+  }
+  
+  # Population-weighted floor for a set of (density, area) pairs: the density at
+  # or below which the cumulative population is <= (1 - coverage) of the total.
+  cumulative_floor <- function(v, a) {
+    if (length(v) == 0) return(0)
+    o    <- order(v)                     # ascending density
+    v    <- v[o]; a <- a[o]
+    frac <- cumsum(v * a) / sum(v * a)   # cumulative population fraction from the bottom
+    below <- which(frac <= (1 - coverage))  # pixels shed without eating into coverage
+    if (length(below) == 0) 0 else v[max(below)]
+  }
+  
+  resolve_absent_limit <- function(rasts) {
+    
+    if (absent_method == "fixed") {
+      return(rast_absent_limit)
+    }
+    
+    if (absent_method == "cumulative") {
+      stopifnot(coverage > 0, coverage < 1)
+      
+      if (coverage_basis == "each") {
+        floors <- vapply(rasts, function(r) {
+          da <- dens_area(r)
+          cumulative_floor(da$v, da$a)
+        }, numeric(1))
+        floor_val <- min(floors, na.rm = TRUE)      # most inclusive -> >= coverage in every period
+      } else {
+        pooled <- lapply(rasts, dens_area)
+        v_all  <- unlist(lapply(pooled, `[[`, "v"))
+        a_all  <- unlist(lapply(pooled, `[[`, "a"))
+        floor_val <- cumulative_floor(v_all, a_all)
+      }
+      
+      # The cumulative-population rule proposes floor_val. The absolute value is
+      # a CAP, not a lower guard: never allow the display threshold to exceed
+      # max_absent_limit. Thus widespread species are not artificially truncated
+      # just because their lowest 1% of predicted population spans a large area.
+      if (!is.numeric(max_absent_limit) || length(max_absent_limit) != 1L ||
+          is.na(max_absent_limit) || max_absent_limit < 0) {
+        stop("max_absent_limit must be a single non-negative number (or Inf).")
+      }
+      return(min(floor_val, max_absent_limit, na.rm = TRUE))
+    }
+    
+    # hybrid
+    vals <- unlist(lapply(rasts, function(r) {
+      terra::values(r, mat = FALSE, na.rm = TRUE)
+    }))
+    vals <- vals[is.finite(vals)]
+    
+    if (length(vals) == 0) {
+      return(rast_absent_limit)
+    }
+    
+    q_absent <- as.numeric(stats::quantile(vals, absent_quantile,      na.rm = TRUE))
+    q_high   <- as.numeric(stats::quantile(vals, relative_to_quantile, na.rm = TRUE))
+    relative_limit <- relative_fraction * q_high
+    
+    max(rast_absent_limit, q_absent, relative_limit, na.rm = TRUE)
+  }
+  
+  resolved_absent_limit <- resolve_absent_limit(rasts)
+  
+  # ------------------------------------------------------------
+  # Process each raster (threshold + per-raster upper limit)
+  # ------------------------------------------------------------
+  
+  process_raster <- function(rast) {
+    
+    # Calculate upper plotting limit from the original raster,
+    # independently of the lower display threshold
+    zmax <- resolve_rast_max(
+      rast       = rast,
+      rast_max   = rast_max,
+      rast_max_q = rast_max_quantile
+    )
+    
+    # Now apply the lower display threshold
+    r <- rast
+    r[r <= resolved_absent_limit] <- NA
+    
+    list(
+      rast = r,
+      zmax = zmax
+    )
+  }
+  
+  processed   <- lapply(rasts, process_raster)
+  zmax_values <- vapply(processed, `[[`, numeric(1), "zmax")
+  
+  zmax_shared <- max(zmax_values, na.rm = TRUE)
+  if (!is.finite(zmax_shared) || zmax_shared <= 0) {
+    zmax_shared <- 1
+  }
+  
+  rasts_clamped <- lapply(processed, function(x) {
+    terra::clamp(x$rast, upper = zmax_shared, values = TRUE)
+  })
+  names(rasts_clamped) <- names(rasts)
+  
+  zlim    <- c(resolved_absent_limit, zmax_shared)
+  zbreaks <- seq(zlim[1], zlim[2], length.out = 5)
+  
+  list(
+    rasters           = rasts_clamped,
+    zlim              = zlim,
+    zbreaks           = zbreaks,
+    zmax_original     = zmax_values,
+    rast_absent_limit = resolved_absent_limit,
+    absent_method     = absent_method,
+    coverage          = if (absent_method == "cumulative") coverage       else NA_real_,
+    coverage_basis    = if (absent_method == "cumulative") coverage_basis else NA_character_
+  )
+}
+
+# Mask a change surface to the relative-abundance display footprint and clamp it
+# to a symmetric range, so a few extreme pixels cannot wash out the broad pattern.
+# Values stay in expected-count units, matching the A2/A3 legends.
+prepare_change_raster <- function(chg_q50,
+                                  ci_width,
+                                  footprint,
+                                  max_q     = 0.99,
+                                  max_value = NULL) {
+  terra::compareGeom(chg_q50, footprint)
+  chg_q50  <- terra::mask(chg_q50, footprint)
+  ci_width <- terra::mask(ci_width, footprint)
+  
+  chg_max <- resolve_positive_max(
+    x = abs(terra::values(chg_q50, mat = FALSE)),
+    max_value = max_value, max_q = max_q, argument_name = "max_value"
+  )
+  width_max <- resolve_positive_max(
+    x = terra::values(ci_width, mat = FALSE),
+    max_q = max_q, argument_name = "width_max"
+  )
+  
+  list(
+    chg_q50   = terra::clamp(chg_q50, lower = -chg_max, upper = chg_max, values = TRUE),
+    ci_width  = terra::clamp(ci_width, upper = width_max, values = TRUE),
+    zlim      = c(-chg_max, chg_max),
+    width_max = width_max
+  )
+}
+
+# Create map of posterior mean relative abundance (or PObs) for one atlas period
+make_map <- function(species_name,
+                     subtitle,
+                     legend_title = "Expected count\nper 5-min\npoint count",
+                     rast,
+                     region,
+                     water      = NULL,
+                     colpal     = NULL,
+                     water_fill = "#b8dceb",
+                     transform  = "identity",
+                     zlim       = NULL,
+                     zbreaks    = NULL,
+                     legend_position = c(0.97, 0.97),
+                     legend_justification = c(1, 1),
+                     clipped    = FALSE) {   # TRUE: rast already cropped/masked to region
+  
+  region <- region |>
+    sf::st_transform(terra::crs(rast))
+  
+  if (!is.null(water)) {
+    water <- water |>
+      sf::st_transform(sf::st_crs(region))
+  }
+  
+  if (!isTRUE(clipped)) {
+    region_vect <- terra::vect(region)
+    rast <- rast |>
+      terra::crop(region_vect) |>
+      terra::mask(region_vect)
+  }
+  
+  if (is.null(colpal)) {
+    colpal <- grDevices::colorRampPalette(c(
+      "#FBF7E2", "#FCF8D0", "#EEF7C2", "#CEF2B0",
+      "#94E5A0", "#51C987", "#18A065", "#008C59",
+      "#007F53", "#006344"
+    ))(100)
+  }
+  
+  rast_df <- as.data.frame(rast, xy = TRUE, na.rm = FALSE)
+  names(rast_df)[3] <- "value"
+  
+  title_text <- paste0(
+    "<span style='font-size:18pt;'><b>", species_name, "</b></span><br><br>",
+    "<span style='font-size:14pt;'>",
+    subtitle,
+    "</span>"
+  )
+  
+  if (is.null(zbreaks) && !is.null(zlim)) {
+    zbreaks <- seq(zlim[1], zlim[2], length.out = 5)
+  }
+  
+  ggplot2::ggplot() +
+    ggplot2::geom_sf(
+      data = region,
+      fill = "white",
+      colour = "black",
+      linewidth = 0.3
+    ) +
+    ggplot2::geom_raster(
+      data = rast_df,
+      ggplot2::aes(x = x, y = y, fill = value)
+    ) +
+    {
+      if (!is.null(water)) {
+        ggplot2::geom_sf(
+          data = water,
+          fill = water_fill,
+          colour = "transparent"
+        )
+      }
+    } +
+    ggplot2::geom_sf(
+      data = region,
+      fill = "transparent",
+      colour = "black",
+      linewidth = 0.3
+    ) +
+    ggspatial::annotation_scale(
+      location = "bl",
+      width_hint = 0.25
+    ) +
+    ggplot2::scale_fill_gradientn(
+      limits   = zlim,
+      breaks   = zbreaks,
+      labels   = scales::label_number(accuracy = 0.01)(zbreaks),
+      colours  = colpal,
+      na.value = "transparent",
+      trans    = "identity",
+      name     =  legend_title,
+      oob      = scales::squish,
+      guide    = ggplot2::guide_colourbar(
+        ticks.linewidth = 0.5,
+        frame.linewidth = 0.5,
+        frame.colour    = "black",
+        ticks.colour    = "black"
+      )
+    )+
+    ggplot2::coord_sf() +
+    ggplot2::ggtitle(title_text) +
+    ggplot2::theme_bw() +
+    ggplot2::theme(
+      plot.title = ggtext::element_markdown(lineheight = 1.1),
+      
+      legend.position      = legend_position,
+      legend.justification = legend_justification,
+      legend.background    = ggplot2::element_rect(fill = "white", colour = NA),
+      
+      panel.background = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.background  = ggplot2::element_rect(fill = "white", colour = "white"),
+      
+      axis.title = ggplot2::element_blank()
+    )
+}
+
+# ------------------------------------------------------------
+# Hex-level absolute population change maps
+# ------------------------------------------------------------
+
+summarize_hex_draw_change <- function(hex_grid,
+                                      hex_draws,
+                                      ci_level = 0.90,
+                                      classify_confidence = 0.90,
+                                      baseline_min = 1e-5,
+                                      min_n_pixels = NULL,
+                                      min_n_pixels_prop = 0.25) {
+  
+  stopifnot(inherits(hex_grid, "sf"))
+  stopifnot("hex_id" %in% names(hex_grid))
+  
+  required_cols <- c("hex_id", "mu_OBBA2", "mu_OBBA3", "n_pixels")
+  missing_cols <- setdiff(required_cols, names(hex_draws))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      "hex_draws is missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+  
+  if (!is.numeric(ci_level) || length(ci_level) != 1 ||
+      ci_level <= 0 || ci_level >= 1) {
+    stop("ci_level must be a single number strictly between 0 and 1.")
+  }
+  
+  # One-sided confidence for the directional change bands. Must exceed 0.5,
+  # otherwise the "increase" bound (the 1 - classify_confidence quantile) would
+  # sit above the "decrease" bound and the bands become incoherent.
+  if (!is.numeric(classify_confidence) || length(classify_confidence) != 1 ||
+      classify_confidence <= 0.5 || classify_confidence >= 1) {
+    stop("classify_confidence must be a single number strictly between 0.5 and 1.")
+  }
+  
+  if (is.null(min_n_pixels)) {
+    min_n_pixels <- min_n_pixels_prop * max(hex_draws$n_pixels, na.rm = TRUE)
+  }
+  
+  hex_draws <- hex_draws |>
+    dplyr::filter(.data$n_pixels >= min_n_pixels)
+  
+  if (nrow(hex_draws) == 0) {
+    stop("summarize_hex_draw_change(): no hexagons have >= ", min_n_pixels, " pixels.")
+  }
+  
+  # One matrix per period (hex x draw); every summary is then a row-wise
+  # matrix operation.
+  mu2 <- do.call(rbind, hex_draws$mu_OBBA2)
+  mu3 <- do.call(rbind, hex_draws$mu_OBBA3)
+  
+  hex_summary <- dplyr::bind_cols(
+    tibble::tibble(
+      hex_id            = hex_draws$hex_id,
+      n_pixels          = hex_draws$n_pixels,
+      min_n_pixels_used = min_n_pixels
+    ),
+    change_draw_summary(
+      mu2                 = mu2,
+      mu3                 = mu3,
+      ci_level            = ci_level,
+      baseline_min        = baseline_min,
+      classify_confidence = classify_confidence
+    )$summary
+  )
+  
+  hex_grid |>
+    dplyr::left_join(hex_summary, by = "hex_id")
+}
+
+# Area-weight of each hexagon inside a polygon (hex_id -> area_weight in [0, 1]).
+#
+# The weight is purely geometric: it depends only on `hex_grid` and `polygon`,
+# NOT on any species' posterior draws. It is therefore identical for every
+# species, so callers that summarise many species over the same set of regions
+# (script 08) compute it ONCE per region and pass the set to
+# summarize_hex_draws_by_region(), instead of paying for the st_intersection()
+# below on every species.
+compute_hex_polygon_weights <- function(hex_grid, polygon) {
+  stopifnot(inherits(hex_grid, "sf"), inherits(polygon, "sf"))
+  stopifnot("hex_id" %in% names(hex_grid))
+  
+  polygon <- sf::st_transform(polygon, sf::st_crs(hex_grid))
+  polygon_union <- sf::st_union(sf::st_make_valid(polygon))
+  
+  hex_area <- sf::st_area(hex_grid)
+  
+  hex_intersection <- suppressWarnings(
+    sf::st_intersection(
+      hex_grid |> dplyr::select(hex_id),
+      sf::st_sf(geometry = polygon_union)
+    )
+  )
+  
+  if (nrow(hex_intersection) == 0) {
+    stop("No hexagons intersect the supplied polygon.")
+  }
+  
+  hex_intersection |>
+    dplyr::mutate(intersection_area = sf::st_area(geometry)) |>
+    sf::st_drop_geometry() |>
+    dplyr::group_by(hex_id) |>
+    dplyr::summarise(
+      intersection_area = sum(intersection_area),
+      .groups = "drop"
+    ) |>
+    dplyr::left_join(
+      tibble::tibble(hex_id = hex_grid$hex_id, hex_area = hex_area),
+      by = "hex_id"
+    ) |>
+    dplyr::mutate(
+      area_weight = as.numeric(intersection_area / hex_area),
+      area_weight = pmin(pmax(area_weight, 0), 1)
+    ) |>
+    dplyr::select(hex_id, area_weight)
+}
+
+# Row-wise posterior summaries of OBBA2 -> OBBA3 change.
+#
+# mu2, mu3  Matrices, one row per unit (hex or region), one column per draw.
+# classify_confidence  If supplied, adds the ONE-SIDED directional bounds used
+#   by classify_min_supported_change(): sym_change_incr_bound is the lower
+#   (1 - classify_confidence) quantile of the log-ratio, sym_change_decr_bound
+#   the upper classify_confidence quantile. Deliberately separate from the
+#   two-sided sym_change_qlow/qhigh (ci_level), which drive interval displays.
+#
+# Quantiles are type 7 (matrixStats default = stats::quantile default).
+# Returns list(summary = tibble, abs_change, prop_change, sym_change) where the
+# last three are the draw matrices.
+change_draw_summary <- function(mu2,
+                                mu3,
+                                ci_level            = 0.90,
+                                baseline_min        = 1e-5,
+                                classify_confidence = NULL) {
+  
+  stopifnot(is.matrix(mu2), is.matrix(mu3), identical(dim(mu2), dim(mu3)))
+  if (!is.numeric(ci_level) || length(ci_level) != 1 ||
+      ci_level <= 0 || ci_level >= 1) {
+    stop("ci_level must be a single number strictly between 0 and 1.")
+  }
+  
+  alpha <- (1 - ci_level) / 2
+  
+  abs_change  <- mu3 - mu2
+  low_base    <- mu2 <= baseline_min
+  prop_change <- abs_change / mu2
+  sym_change  <- log(mu3 / mu2)
+  prop_change[low_base] <- NA_real_
+  sym_change[low_base]  <- NA_real_
+  
+  row_q <- function(m, p) {
+    as.vector(matrixStats::rowQuantiles(m, probs = p, na.rm = TRUE))
+  }
+  four_stats <- function(m, prefix) {
+    stats::setNames(
+      list(rowMeans(m, na.rm = TRUE),
+           as.vector(matrixStats::rowMedians(m, na.rm = TRUE)),
+           row_q(m, alpha),
+           row_q(m, 1 - alpha)),
+      paste0(prefix, c("_mean", "_median", "_qlow", "_qhigh"))
+    )
+  }
+  
+  out <- tibble::as_tibble(c(
+    four_stats(mu2,         "mu2"),
+    four_stats(mu3,         "mu3"),
+    four_stats(abs_change,  "abs_change"),
+    four_stats(prop_change, "prop_change"),
+    four_stats(sym_change,  "sym_change")
+  ))
+  
+  if (!is.null(classify_confidence)) {
+    out$sym_change_incr_bound <- row_q(sym_change, 1 - classify_confidence)
+    out$sym_change_decr_bound <- row_q(sym_change, classify_confidence)
+  }
+  
+  out$p_increase <- rowMeans(abs_change > 0, na.rm = TRUE)
+  out$p_decrease <- rowMeans(abs_change < 0, na.rm = TRUE)
+  out$direction  <- dplyr::case_when(
+    out$p_increase > 0.975 ~ "increase",
+    out$p_decrease > 0.975 ~ "decrease",
+    TRUE ~ "uncertain"
+  )
+  
+  list(summary     = out,
+       abs_change  = abs_change,
+       prop_change = prop_change,
+       sym_change  = sym_change)
+}
+
+# Area-weighted posterior change for SEVERAL regions in one pass.
+#
+# The hex draw matrices are built once and the regions become columns of a
+# hex x region weight matrix, aggregated with one crossprod(). NA draws are
+# treated as 0.
+#
+# region_weights  Named list of hex_id/area_weight tables
+#                 (compute_hex_polygon_weights()); names become region keys.
+# Returns list(summary = tibble, one row per region in list order (n_hex_used,
+# sum_area_weight, then the change_draw_summary() columns); draws = named list
+# of per-region draw vectors (mu2, mu3, abs_change, prop_change, sym_change),
+# or NULL).
+summarize_hex_draws_by_region <- function(hex_draws,
+                                          region_weights,
+                                          ci_level     = 0.90,
+                                          baseline_min = 1e-5,
+                                          return_draws = FALSE) {
+  
+  missing_cols <- setdiff(c("hex_id", "mu_OBBA2", "mu_OBBA3"), names(hex_draws))
+  if (length(missing_cols) > 0) {
+    stop("hex_draws is missing required columns: ",
+         paste(missing_cols, collapse = ", "))
+  }
+  stopifnot(is.list(region_weights), !is.null(names(region_weights)))
+  
+  mu2 <- do.call(rbind, hex_draws$mu_OBBA2)
+  mu3 <- do.call(rbind, hex_draws$mu_OBBA3)
+  if (!identical(dim(mu2), dim(mu3))) {
+    stop("mu_OBBA2 and mu_OBBA3 draw matrices do not have identical dimensions.")
+  }
+  mu2[is.na(mu2)] <- 0
+  mu3[is.na(mu3)] <- 0
+  
+  n_hex <- nrow(hex_draws)
+  W <- matrix(
+    vapply(region_weights, function(w) {
+      m <- match(hex_draws$hex_id, w$hex_id)
+      ifelse(is.na(m), 0, w$area_weight[m])
+    }, numeric(n_hex)),
+    nrow = n_hex, dimnames = list(NULL, names(region_weights))
+  )
+  
+  reg_mu2 <- crossprod(W, mu2)   # region x draw
+  reg_mu3 <- crossprod(W, mu3)
+  
+  cs <- change_draw_summary(mu2 = reg_mu2, mu3 = reg_mu3,
+                            ci_level = ci_level, baseline_min = baseline_min)
+  
+  summary <- dplyr::bind_cols(
+    tibble::tibble(
+      n_hex_used      = vapply(region_weights,
+                               function(w) sum(hex_draws$hex_id %in% w$hex_id),
+                               integer(1), USE.NAMES = FALSE),
+      sum_area_weight = unname(colSums(W))
+    ),
+    cs$summary
+  )
+  
+  draws <- NULL
+  if (isTRUE(return_draws)) {
+    draws <- lapply(stats::setNames(seq_along(region_weights), names(region_weights)),
+                    function(k) list(mu2         = reg_mu2[k, ],
+                                     mu3         = reg_mu3[k, ],
+                                     abs_change  = cs$abs_change[k, ],
+                                     prop_change = cs$prop_change[k, ],
+                                     sym_change  = cs$sym_change[k, ]))
+  }
+  
+  list(summary = summary, draws = draws)
+}
+
+# ------------------------------------------------------------
+# Change-map colours and legend
+# ------------------------------------------------------------
+
+classify_min_supported_change <- function(hex_sf) {
+  
+  # One-sided directional bounds from summarize_hex_draw_change(). incr_bound is
+  # the lower (1 - classify_confidence) quantile of the log-ratio; decr_bound the
+  # upper classify_confidence quantile. Each band is thus a one-sided claim at
+  # classify_confidence (90% by default), matching the map legend.
+  required_cols <- c("sym_change_incr_bound", "sym_change_decr_bound")
+  missing_cols <- setdiff(required_cols, names(hex_sf))
+  
+  if (length(missing_cols) > 0) {
+    stop(
+      "hex_sf is missing required columns: ",
+      paste(missing_cols, collapse = ", ")
+    )
+  }
+  
+  hex_sf |>
+    dplyr::mutate(
+      min_supported_change = dplyr::case_when(
+        
+        is.na(.data$sym_change_incr_bound) | is.na(.data$sym_change_decr_bound) ~ NA_character_,
+        
+        # Increases: one-sided lower bound above threshold
+        .data$sym_change_incr_bound >= log(2.0) ~ "> 2x",
+        .data$sym_change_incr_bound >= log(1.5) ~ "1.5x to 2x",
+        .data$sym_change_incr_bound >= log(1.1) ~ "1.1x to 1.5x",
+        
+        # Declines: one-sided upper bound below threshold
+        .data$sym_change_decr_bound <= log(1 / 2.0) ~ "< 0.5x",
+        .data$sym_change_decr_bound <= log(1 / 1.5) ~ "0.5x to 0.67x",
+        .data$sym_change_decr_bound <= log(1 / 1.1) ~ "0.67x to 0.9x",
+        
+        TRUE ~ "0.9x to 1.1x"
+      ),
+      
+      min_supported_change = factor(
+        min_supported_change,
+        levels = c(
+          "< 0.5x",
+          "0.5x to 0.67x",
+          "0.67x to 0.9x",
+          "0.9x to 1.1x",
+          "1.1x to 1.5x",
+          "1.5x to 2x",
+          "> 2x"
+        ),
+        ordered = TRUE
+      )
+    )
+}
+
+get_min_supported_change_scale <- function() {
+  
+  change_levels <- c(
+    "< 0.5x", "0.5x to 0.67x", "0.67x to 0.9x",
+    "0.9x to 1.1x",
+    "1.1x to 1.5x", "1.5x to 2x", "> 2x"
+  )
+  
+  change_labels <- c(
+    "-50%", "-33%", "-10%",
+    "Weak or\nuncertain",
+    "+10%", "+50%", "+100%"
+  )
+  
+  tweak_colour <- function(col, lighten_amount = -0.15, saturate_amount = 0.2) {
+    hsl <- as(colorspace::hex2RGB(col), "HLS")
+    hsl@coords[, "L"] <- pmin(1, pmax(0, hsl@coords[, "L"] + lighten_amount))
+    hsl@coords[, "S"] <- pmin(1, pmax(0, hsl@coords[, "S"] + saturate_amount))
+    colorspace::hex(hsl)
+  }
+  
+  change_colours <- RColorBrewer::brewer.pal(7, "RdBu")
+  change_colours[4] <- "white"
+  change_colours[-4] <- sapply(
+    change_colours[-4],
+    tweak_colour,
+    lighten_amount = -0.1,
+    saturate_amount = 0.1
+  )
+  
+  list(
+    levels = change_levels,
+    labels = change_labels,
+    colours = change_colours
+  )
+}
+
+
+make_min_supported_change_legend <- function(ci_level = 0.90) {
+  
+  change_scale <- get_min_supported_change_scale()
+  
+  legend_df <- tibble::tibble(
+    level = change_scale$levels,
+    label = change_scale$labels,
+    y = seq_along(change_scale$levels)
+  )
+  
+  legend_title <- paste0(
+    "Population changed\nby at least this much\n(",
+    round(ci_level * 100),
+    "% confident)"
+  )
+  
+  title_y <- max(legend_df$y) + 1.6
+  
+  ggplot2::ggplot(legend_df, ggplot2::aes(x = 1, y = y)) +
+    ggplot2::geom_tile(
+      ggplot2::aes(fill = level),
+      colour = "grey40",
+      width = 0.6,
+      height = 0.8,
+      linewidth = 0.3
+    ) +
+    ggplot2::geom_text(
+      ggplot2::aes(x = 1.55, label = label),
+      hjust = 0,
+      size = 3
+    ) +
+    ggplot2::annotate(
+      "text",
+      x = 0.6,
+      y = title_y,
+      label = legend_title,
+      hjust = 0,
+      vjust = 1,
+      size = 3.5,
+      fontface = "plain",
+      lineheight = 0.9
+    ) +
+    ggplot2::scale_fill_manual(
+      values = stats::setNames(change_scale$colours, change_scale$levels),
+      guide = "none"
+    ) +
+    ggplot2::coord_cartesian(
+      xlim = c(0.5, 6.5),
+      ylim = c(0.5, title_y + 0.2),
+      clip = "off"
+    ) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.margin = ggplot2::margin(2, 8, 2, 2)
+    )
+}
+
+# ------------------------------------------------------------
+# Make change map
+# ------------------------------------------------------------
+
+make_hex_abs_change_map <- function(species_name,
+                                    hex_change_sf,
+                                    region,
+                                    region_boundaries = NULL,
+                                    prov_change = NULL,
+                                    map_confidence = 0.90,   # one-sided; drives the legend text only
+                                    size_var = "mu_mid_median",
+                                    zlim = NULL,
+                                    filter_low_abundance = TRUE,
+                                    water = NULL,
+                                    water_fill = "#b8dceb",
+                                    clip_boundaries = TRUE,   # FALSE: region_boundaries already clipped to region
+                                    legend_inset = c(
+                                      left = 0.8,
+                                      bottom = 0.5,
+                                      right = 1.0,
+                                      top = 0.99
+                                    )) {
+  
+  stopifnot(inherits(hex_change_sf, "sf"))
+  stopifnot(inherits(region, "sf"))
+  stopifnot("min_supported_change" %in% names(hex_change_sf))
+  
+  region <- sf::st_transform(region, sf::st_crs(hex_change_sf))
+  
+  if (!is.null(water)) {
+    water <- sf::st_transform(water, sf::st_crs(hex_change_sf))
+  }
+  
+  if (!is.null(region_boundaries)) {
+    region_boundaries <- sf::st_transform(region_boundaries, sf::st_crs(hex_change_sf))
+    if (isTRUE(clip_boundaries)) {
+      region_boundaries <- sf::st_intersection(region_boundaries, region)
+    }
+  }
+  
+  # Show hexes where the species was present in either atlas
+  hex_change_sf <- hex_change_sf |>
+    dplyr::mutate(
+      mu_max_median = pmax(mu2_median, mu3_median, na.rm = TRUE),
+      mu_mid_median = (mu2_median + mu3_median) / 2
+    )
+  
+  stopifnot(size_var %in% names(hex_change_sf))
+  
+  if (filter_low_abundance) {
+    
+    if (is.null(zlim) || length(zlim) < 1 || !is.finite(zlim[1])) {
+      stop("zlim must be supplied when filter_low_abundance = TRUE")
+    }
+    
+    absence_threshold <- zlim[1]
+    
+    hex_change_sf <- hex_change_sf |>
+      dplyr::filter(mu_max_median > absence_threshold)
+  }
+  
+  change_scale <- get_min_supported_change_scale()
+  
+  # Match old title formatting
+  fmt_pct <- function(x, digits = 1) {
+    ifelse(
+      is.na(x),
+      NA_character_,
+      sprintf("%+.1f", round(100 * x, digits))
+    )
+  }
+  
+  if (!is.null(prov_change)) {
+    title_text <- paste0(
+      "<span style='font-size:18pt;'><b>", species_name, "</b></span><br><br>",
+      "<span style='font-size:14pt;'>",
+      "Overall change = ",
+      fmt_pct(prov_change$prop_change_median), "% [",
+      fmt_pct(prov_change$prop_change_qlow), "% to ",
+      fmt_pct(prov_change$prop_change_qhigh), "%]",
+      "</span>"
+    )
+  } else {
+    title_text <- paste0(
+      "<span style='font-size:18pt;'><b>", species_name, "</b></span>"
+    )
+  }
+  
+  legend_plot <- make_min_supported_change_legend(ci_level = map_confidence)
+  
+  chg_plot <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = region, fill = "gray90")
+  
+  if (!is.null(water)) {
+    chg_plot <- chg_plot +
+      ggplot2::geom_sf(
+        data = water,
+        fill = water_fill,
+        colour = "transparent"
+      )
+  }
+  
+  if (!is.null(region_boundaries)) {
+    chg_plot <- chg_plot +
+      ggplot2::geom_sf(
+        data = region_boundaries,
+        fill = "transparent",
+        colour = "gray30"
+      )
+  }
+  
+  chg_plot <- chg_plot +
+    ggplot2::geom_sf(
+      data = sf::st_centroid(hex_change_sf),
+      ggplot2::aes(
+        colour = min_supported_change,
+        size = .data[[size_var]]
+      )
+    ) +
+    ggplot2::geom_sf(
+      data = region,
+      fill = "transparent",
+      colour = "black",
+      linewidth = 0.3
+    ) +
+    ggspatial::annotation_scale(
+      location = "bl",
+      width_hint = 0.25
+    ) +
+    ggplot2::scale_colour_manual(
+      values = stats::setNames(change_scale$colours, change_scale$levels),
+      limits = change_scale$levels,
+      drop = FALSE,
+      guide = "none"
+    ) +
+    ggplot2::scale_size_continuous(
+      range = c(0, 2),
+      guide = "none"
+    ) +
+    ggplot2::theme_bw() +
+    ggplot2::ggtitle(title_text) +
+    ggplot2::theme(
+      plot.title = ggtext::element_markdown(lineheight = 1.1),
+      panel.background = ggplot2::element_rect(fill = "transparent", colour = NA),
+      plot.background  = ggplot2::element_rect(fill = "transparent", colour = NA),
+      axis.title = ggplot2::element_blank()
+    )
+  
+  chg_plot +
+    patchwork::inset_element(
+      legend_plot,
+      left = legend_inset[["left"]],
+      bottom = legend_inset[["bottom"]],
+      right = legend_inset[["right"]],
+      top = legend_inset[["top"]],
+      on_top = TRUE
+    )
+}
+
+
+# Assess model predictions against survey observations at any spatial scale
+#
+# Orchestrates the full workflow:
+#   1. Accept a pre-built hexagon grid (or build one if `n_hexagons` is
+#      supplied and `hex_grid` is NULL).
+#   2. Summarise survey observations and raster predictions per hexagon
+#      (`summarize_hex`).
+#   3. Compute region-wide validation statistics (`compute_region_stats`).
+#   4. Build a two-panel patchwork figure:
+#      - Panel A: raw raster of model predictions (`plot_raster_gg`).
+#      - Panel B: honeycomb effort/detection map (`plot_honeycomb`).
+#
+# When looping over many species for the same region, build the hex grid once
+# with `make_hex_grid()` (spatial_utils.R) and pass it via `hex_grid` to avoid rebuilding it on
+# every iteration.
+#
+# Argument: region          `sf` polygon defining the study area extent. Used for
+#   plotting and, when `hex_grid` is NULL, for building the grid.
+# Argument: sp_dat          `sf` data frame with a `count_per_effort` column.
+# Argument: rast            `SpatRaster` of model predictions. Absent cells should
+#   be 0 or NA; both are treated as zero when computing hex means, and rendered
+#   as transparent in all map panels.
+# Argument: hex_grid        Pre-built hexagon grid (`sf` output of
+#   `make_hex_grid()`). When supplied, `n_hexagons` is ignored and no grid is
+#   built internally. Pass `NULL` (default) to build the grid from `region`
+#   and `n_hexagons`.
+# Argument: n_hexagons      Target number of hexagons. Only used when `hex_grid`
+#   is NULL. Default `1000`.
+# Argument: water           Optional `sf` water polygons drawn on the honeycomb
+#                        panel. Pass `NULL` to omit water.
+# Argument: rast_max_q      Quantile (0-1) used to cap the colour scale upper end
+#   and clip outlier pixel values before extraction. Default `0.99`.
+# Argument: transform       Colour scale transform: `"identity"`, `"sqrt"`,
+#                        `"log"`, etc.
+# Argument: pred_presence_threshold  `pred_mean` values strictly above this are
+#   classified as model-predicted present in `hex_summary` and used for P/A
+#   statistics. Default `0`.
+# Argument: title           Optional character string added as a patchwork
+#                        annotation title above the two panels.
+# Argument: model_source    Optional character string identifying the model source
+#                        (e.g. `"BAM"`, `"Atlas"`). Displayed in the subtitle
+#                        when either `model_source` or `data_source` is
+#                        non-NULL.
+# Argument: data_source     Optional character string identifying the survey data
+#                        source (e.g. `"BAM"`, `"Atlas"`). Displayed in the
+#                        subtitle alongside `model_source`.
+#
+# Returns: A named list:
+#   \describe{
+#     \item{`plot_combined`}{A `patchwork` ggplot (two panels).}
+#     \item{`hex_summary`}{`sf` data frame with one row per hexagon
+#       containing columns from `summarize_hex()`.}
+#     \item{`region_stats`}{One-row `data.frame` from `compute_region_stats()`.}
+#   }
+assess_region <- function(region,
+                          region_boundaries       = NULL,
+                          sp_dat,
+                          rast,
+                          hex_grid                = NULL,
+                          n_hexagons              = 1000,
+                          water                   = NULL,
+                          rast_max_q              = 0.99,
+                          rast_max                = NULL,
+                          rast_min                = NULL,
+                          max_count_per_effort    = NULL,
+                          count_max_q             = 0.99,
+                          max_surveys             = NULL,
+                          max_surveys_q           = 0.80,
+                          transform               = "identity",
+                          pred_presence_threshold = 0,
+                          title                   = NULL,
+                          model_source            = NULL,
+                          data_source             = NULL,
+                          color_palette           = NULL,
+                          count_size_label        = "observed mean count in hexagon",
+                          special_dat             = NULL,  # per-atlas special-survey sf, or NULL
+                          # Fast path (see build_period_assessments()). When
+                          # region_index is supplied, sp_dat / special_dat /
+                          # rast / region_boundaries are ALREADY clipped to the
+                          # region and carry `.hex_id`; no geometry is redone.
+                          region_index            = NULL,
+                          hex_obs                 = NULL   # precomputed summarize_surveys_by_hex()
+                          ) {
+  
+  stopifnot(inherits(region, "sf"))
+  stopifnot(inherits(sp_dat, "sf"))
+  stopifnot(inherits(rast, "SpatRaster"))
+  if (!is.null(hex_grid)) stopifnot(inherits(hex_grid, "sf"))
+  
+  prepared <- !is.null(region_index)
+  region   <- sf::st_transform(region, sf::st_crs(sp_dat))
+  
+  if (!prepared) {
+    sp_dat <- sf::st_filter(sp_dat, region, .predicate = sf::st_intersects)
+    
+    # Special-survey rows for this region (no effort; shown as the overlay only).
+    if (!is.null(special_dat)) {
+      stopifnot(inherits(special_dat, "sf"))
+      special_dat <- sf::st_filter(
+        special_dat, sf::st_transform(region, sf::st_crs(special_dat)),
+        .predicate = sf::st_intersects
+      )
+    }
+    
+    if (!is.null(region_boundaries)) {
+      region_boundaries <- region_boundaries |>
+        sf::st_transform(sf::st_crs(region)) |>
+        sf::st_intersection(region)
+    }
+    
+    region_vect  <- terra::vect(sf::st_transform(region, terra::crs(rast)))
+    rast_cropped <- rast |>
+      terra::crop(region_vect) |>
+      terra::mask(region_vect)
+  } else {
+    rast_cropped <- rast
+  }
+
+  # Tallies from exactly the surveys this region+period panel displays.
+  honey_counts <- survey_detection_counts(sp_dat)
+  
+  # -- GOAL 1: Hexagon grid ---------------------------------------------------
+  # Use the supplied grid if provided; build one otherwise.
+  if (is.null(hex_grid)) {
+    hex_grid <- make_hex_grid(region, n_hexagons = n_hexagons)
+  }
+  
+  # -- GOAL 2: Per-hexagon summaries -----------------------------------------
+  hex_summary <- summarize_hex(
+    dat                     = sp_dat,
+    hex_grid                = hex_grid,
+    rast                    = rast_cropped,
+    rast_max_q              = rast_max_q,
+    rast_max                = rast_max,
+    pred_presence_threshold = pred_presence_threshold,
+    hex_obs                 = hex_obs,
+    hex_cells               = region_index$hex_cells,
+    hex_col                 = if (prepared) ".hex_id"
+  )
+  
+  # -- GOAL 3: Region-wide statistics ----------------------------------------
+  region_stats <- compute_region_stats(hex_summary)
+  
+  # -- GOAL 3b: Resolve display-scale limits ---------------------------------
+  # These values are passed to all relevant panels so scale limits are not
+  # recomputed independently within each plotting function. To force identical
+  # scaling across atlas periods, calculate shared values outside this function
+  # and pass them through rast_max, max_count_per_effort, and max_surveys.
+  scale_limits <- compute_assessment_scale_limits(
+    hex_summaries        = list(hex_summary),
+    rasts                = list(rast_cropped),
+    rast_max             = rast_max,
+    rast_max_q           = rast_max_q,
+    max_count_per_effort = max_count_per_effort,
+    count_max_q          = count_max_q,
+    max_surveys          = max_surveys,
+    max_surveys_q        = max_surveys_q
+  )
+  
+  # -- GOAL 4a: Panel A – raw raster -----------------------------------------
+  p_rast <- plot_raster_gg(
+    rast       = rast_cropped,
+    study_area = region,
+    region_boundaries = region_boundaries,
+    rast_max_q = rast_max_q,
+    rast_max   = scale_limits$rast_max,
+    rast_min   = rast_min,
+    transform  = transform,
+    palette    = color_palette,
+    clipped    = prepared
+  )
+  
+  # Per-hexagon special-survey overlay (all-FALSE when special_dat is NULL).
+  special_hex <- summarize_special_by_hex(dat = special_dat, hex_grid = hex_grid,
+                                          hex_col = if (prepared) ".hex_id")
+
+  # -- GOAL 4b: Panel B – honeycomb effort/detection -------------------------
+  p_honey <- plot_honeycomb(
+    hex_summary          = hex_summary,
+    study_area           = region,
+    region_boundaries = region_boundaries,
+    water                = water,
+    max_surveys          = scale_limits$max_surveys,
+    max_surveys_q        = max_surveys_q,
+    max_count_per_effort   = scale_limits$max_count_per_effort,
+    max_count_per_effort_q = count_max_q,
+    count_size_label       = count_size_label,
+    survey_counts          = honey_counts,
+    special_hex            = special_hex
+  )
+  
+  # -- Compose figure --------------------------------------------------------
+  
+  combined <-
+    (p_rast           + margin_theme) +
+    (p_honey          + margin_theme) +
+    patchwork::plot_layout(ncol = 2)
+  
+  # Build annotation: title and optional subtitle from model/data source
+  if (!is.null(title) || !is.null(model_source) || !is.null(data_source)) {
+    
+    subtitle <- NULL
+    if (!is.null(model_source) || !is.null(data_source)) {
+      parts <- c(
+        if (!is.null(model_source)) paste("Model:", model_source),
+        if (!is.null(data_source))  paste("Data:",  data_source)
+      )
+      subtitle <- paste(parts, collapse = "   |   ")
+    }
+    
+    combined <- combined +
+      patchwork::plot_annotation(
+        title    = title,
+        subtitle = subtitle,
+        theme    = ggplot2::theme(
+          plot.title    = ggplot2::element_text(size = 18, face = "bold",
+                                                margin = ggplot2::margin(b = 2)),
+          plot.subtitle = ggplot2::element_text(size = 12, colour = "grey30",
+                                                margin = ggplot2::margin(b = 6))
+        )
+      )
+  }
+  
+  list(
+    p_rast = p_rast,
+    p_honey = p_honey,
+    plot_combined = combined,
+    hex_summary   = hex_summary,
+    region_stats  = region_stats,
+    scale_limits  = scale_limits
+  )
+}
+
+# Combine observed-survey and model-prediction summaries at the hexagon level
+#
+# A convenience wrapper that runs `summarize_surveys_by_hex()` and
+# `extract_hex_predictions()` in sequence and merges both sets of columns onto
+# the hex grid. Also adds a `pred_detected` binary column (TRUE when
+# `pred_mean` strictly exceeds `pred_presence_threshold`).
+#
+# Absent pixels (0 or NA) in the raster are included in the hex mean
+# denominator, so `pred_mean` reflects true spatial average abundance across
+# the whole hexagon area (see `extract_hex_predictions()` for details).
+#
+# Argument: dat                    An `sf` object with a `count_per_effort` column.
+# Argument: hex_grid               Output of `make_hex_grid()`.
+# Argument: rast                   A `SpatRaster` of model predictions.
+# Argument: rast_max_q             Upper quantile cap passed to
+#   `extract_hex_predictions()`. Default `0.99`.
+# Argument: pred_presence_threshold `pred_mean` values strictly above this are
+#   classified as model-predicted present. Default `0` (any positive mean
+#   abundance counts as presence).
+# Returns: An `sf` object (one row per hexagon) with columns:
+#   `hex_id`, `n_surveys`, `mean_count_per_effort`, `obs_detected`,
+#   `pred_mean`, `pred_detected`, `geometry`.
+summarize_hex <- function(dat,
+                          hex_grid,
+                          rast,
+                          rast_max_q              = 1,
+                          rast_max                = NULL,
+                          pred_presence_threshold = 0,
+                          hex_obs                 = NULL,  # precomputed survey summary
+                          hex_cells               = NULL,  # build_region_raster_index()$hex_cells
+                          hex_col                 = NULL) {
+  
+  if (is.null(hex_obs)) {
+    hex_obs <- summarize_surveys_by_hex(dat, hex_grid, hex_col = hex_col)
+  }
+  
+  hex_full <- extract_hex_predictions(
+    hex_obs,
+    rast,
+    rast_max_q = rast_max_q,
+    rast_max   = rast_max,
+    hex_cells  = hex_cells
+  )
+  
+  hex_full |>
+    dplyr::mutate(
+      pred_detected = dplyr::if_else(
+        is.finite(pred_mean) & pred_mean > pred_presence_threshold,
+        TRUE, FALSE
+      )
+    )
+}
+
+# Survey rows (geometry dropped) with a `hex_id` column: either the precomputed
+# hex_col, or a st_within join to hex_grid. Rows in no hexagon are dropped.
+join_surveys_to_hex <- function(dat, hex_grid, hex_col = NULL) {
+  if (!is.null(hex_col)) {
+    out <- sf::st_drop_geometry(dat)
+    out$hex_id <- out[[hex_col]]
+    return(out[!is.na(out$hex_id), , drop = FALSE])
+  }
+  if (sf::st_crs(dat) != sf::st_crs(hex_grid)) {
+    dat <- sf::st_transform(dat, sf::st_crs(hex_grid))
+  }
+  sf::st_join(dat, hex_grid["hex_id"], join = sf::st_within, left = FALSE) |>
+    sf::st_drop_geometry()
+}
+
+# Summarise point-count / ARU surveys by hexagon
+#
+# Spatially joins survey points to hexagons and computes, for each hexagon:
+# the number of surveys, the mean count-per-effort, and a binary
+# presence/absence flag.
+#
+# Argument: dat      An `sf` object with a `count_per_effort` numeric column.
+# Argument: hex_grid An `sf` hexagon grid (output of `make_hex_grid()`).
+# Returns: The full hex grid with added columns:
+#   \describe{
+#     \item{`n_surveys`}{Number of survey visits (0 for unsurveyed hexagons).}
+#     \item{`mean_count_per_effort`}{Mean count per effort (NA for unsurveyed).}
+#     \item{`obs_detected`}{Logical: TRUE if any survey detected the species.}
+#   }
+# Argument: hex_col  Optional column of dat holding a precomputed hex id (as
+#   assigned by add_region_survey_index()); skips the spatial join.
+summarize_surveys_by_hex <- function(dat, hex_grid, hex_col = NULL) {
+  
+  stopifnot(inherits(dat, "sf"))
+  stopifnot(inherits(hex_grid, "sf"))
+  stopifnot("count_per_effort" %in% names(dat))
+  
+  if (!"hex_id" %in% names(hex_grid)) {
+    hex_grid$hex_id <- seq_len(nrow(hex_grid))
+  }
+  
+  hex_obs <- join_surveys_to_hex(dat, hex_grid, hex_col = hex_col) |>
+    dplyr::group_by(hex_id) |>
+    dplyr::summarise(
+      n_surveys             = dplyr::n(),
+      mean_count_per_effort = mean(count_per_effort, na.rm = TRUE),
+      obs_detected          = any(count_per_effort > 0, na.rm = TRUE),
+      .groups = "drop"
+    )
+  
+  hex_grid |>
+    dplyr::left_join(hex_obs, by = "hex_id") |>
+    dplyr::mutate(
+      n_surveys             = dplyr::coalesce(n_surveys, 0L),
+      mean_count_per_effort = dplyr::if_else(n_surveys > 0,
+                                             mean_count_per_effort, NA_real_),
+      obs_detected          = dplyr::if_else(n_surveys > 0,
+                                             dplyr::coalesce(obs_detected, FALSE),
+                                             NA)
+    )
+}
+
+# Per-hexagon special-survey occurrence / detection flags.
+#
+# Special (targeted single-protocol) surveys carry no effort covariate, so they
+# are not summarised as an effort surface. Instead we record, per hexagon, two
+# logicals used by plot_honeycomb() to draw the overlay:
+#   special_surveyed  TRUE if >= 1 special survey fell in the hexagon
+#   special_detected  TRUE if >= 1 of those had count > 0 (species detected)
+# dat may be NULL or a zero-row sf (modes without special surveys), in which case every
+# hexagon is FALSE.
+summarize_special_by_hex <- function(dat, hex_grid, hex_col = NULL) {
+  stopifnot(inherits(hex_grid, "sf"))
+  if (!"hex_id" %in% names(hex_grid)) {
+    hex_grid$hex_id <- seq_len(nrow(hex_grid))
+  }
+
+  if (is.null(dat) || nrow(dat) == 0) {
+    return(hex_grid |>
+             dplyr::mutate(special_surveyed = FALSE, special_detected = FALSE))
+  }
+
+  stopifnot(inherits(dat, "sf"), "count" %in% names(dat))
+
+  hex_obs <- join_surveys_to_hex(dat, hex_grid, hex_col = hex_col) |>
+    dplyr::group_by(hex_id) |>
+    dplyr::summarise(
+      special_surveyed = TRUE,
+      special_detected = any(is.finite(count) & count > 0),
+      .groups = "drop"
+    )
+
+  hex_grid |>
+    dplyr::left_join(hex_obs, by = "hex_id") |>
+    dplyr::mutate(
+      special_surveyed = dplyr::coalesce(special_surveyed, FALSE),
+      special_detected = dplyr::coalesce(special_detected, FALSE)
+    )
+}
+
+# Extract raster model predictions into each hexagon
+#
+# Computes the mean predicted abundance within each hexagon, treating absent
+# pixels (0 or NA in the input raster) as zero so that partial occupancy is
+# correctly reflected in the hex mean. For example, if 50 % of pixels in a
+# hexagon are absent (0/NA) and the remaining 50 % have a predicted value of
+# 1, the returned `pred_mean` will be 0.5.
+#
+# The upper-quantile cap (`rast_max_q`) is applied to non-zero pixels before
+# extraction so that extreme outliers do not distort hex means, but absent
+# pixels are never excluded from the denominator.
+#
+# Argument: hex_grid     An `sf` hexagon grid (output of `make_hex_grid()`).
+# Argument: rast         A `SpatRaster` of model predictions. Absent cells should
+#   be encoded as 0 or NA; both are treated as zero during averaging.
+# Argument: rast_max_q   Upper quantile used to cap non-zero pixel values before
+#   extraction. Default `0.99`.
+# Returns: The hex grid with an added column `pred_mean` (mean predicted
+#   relative abundance within the hexagon, inclusive of absent pixels; NA only
+#   where the hexagon falls entirely outside the raster extent).
+extract_hex_predictions <- function(hex_grid,
+                                    rast,
+                                    rast_max_q = 1,
+                                    rast_max = NULL,
+                                    hex_cells = NULL) {
+  
+  stopifnot(inherits(hex_grid, "sf"))
+  stopifnot(inherits(rast, "SpatRaster"))
+  
+  # Fast path: hex_cells (build_region_raster_index()) lists the cells of this
+  # region raster whose centres fall in each hex -- the cells extract(fun = mean)
+  # averages below -- so the same clamp / NA->0 / mean is a vector operation.
+  if (!is.null(hex_cells)) {
+    r_max <- resolve_rast_max(rast = rast, rast_max = rast_max, rast_max_q = rast_max_q)
+    v <- pmin(terra::values(rast, mat = FALSE)[hex_cells$cell], r_max)
+    v[is.na(v)] <- 0
+    hex_mean <- tapply(v, hex_cells$hex_id, mean)
+    return(hex_grid |>
+             dplyr::mutate(pred_mean = as.vector(hex_mean[as.character(hex_id)])))
+  }
+  
+  # Align CRS
+  hex_proj  <- sf::st_transform(hex_grid, terra::crs(rast))
+  rast_crop <- terra::crop(rast, terra::vect(hex_proj))
+  
+  # Cap extreme non-zero values (outlier suppression only; does not affect
+  # which pixels count as absent). The cap can be either an explicit maximum
+  # or a quantile-derived maximum.
+  r_max <- resolve_rast_max(
+    rast       = rast_crop,
+    rast_max   = rast_max,
+    rast_max_q = rast_max_q
+  )
+  rast_crop <- terra::clamp(rast_crop, upper = r_max, values = TRUE)
+  
+  # Convert NA to 0 so absent pixels are included in the denominator.
+  # We work on a copy to avoid modifying the caller's raster object.
+  rast_for_extract <- terra::subst(rast_crop, from = NA, to = 0)
+  
+  # Extract: na.rm = FALSE is intentional — there are no NAs left, and we
+  # want every pixel (including the zeros) in the mean.
+  pred_ex  <- terra::extract(rast_for_extract, terra::vect(hex_proj),
+                             fun = mean, na.rm = FALSE)
+  pred_col <- names(pred_ex)[2]
+  
+  hex_grid |>
+    dplyr::mutate(
+      # Hexagons with no raster coverage at all are left as NA
+      pred_mean = dplyr::if_else(
+        is.finite(pred_ex[[pred_col]]),
+        pred_ex[[pred_col]],
+        NA_real_
+      )
+    )
+}
+
+# Compute region-wide model-validation statistics
+#
+# Takes a hex-level summary (output of `summarize_hex()`) and computes
+# summary statistics across all hexagons that were actually surveyed.
+#
+# **Statistics returned**
+# | Name | Description |
+# |------|-------------|
+# | `n_hex_surveyed` | Hexagons with >=1 survey |
+# | `n_hex_detected` | Hexagons where species was detected |
+# | `prop_hex_detected` | Detection rate (detected / surveyed) |
+# | `cor_obs_pred` | Pearson r between mean observed count and mean predicted abundance (unweighted) |
+# | `cor_obs_pred_wtd` | Pearson r weighted by number of surveys per hexagon |
+# | `pa_agreement` | Proportion of surveyed hexagons where observed P/A matches predicted P/A |
+# | `pa_sensitivity` | True-positive rate: model predicted present when observed present |
+# | `pa_specificity` | True-negative rate: model predicted absent when observed absent |
+# | `n_surveys_total` | Total individual survey visits across region |
+# | `mean_surveys_per_hex` | Average surveys per surveyed hexagon |
+# | `prop_det_in_pred_absent` | Of hexagons where species was detected, proportion where mean model prediction was at or below `absence_threshold` |
+# | `absence_threshold` | The threshold value used to define model-predicted absence (echoed from input) |
+# | `prop_absent_in_pred_high` | Of hexagons where model predicted high abundance (>= `high_abundance_threshold`), proportion where species was not detected |
+# | `high_abundance_threshold` | The threshold used to define high predicted abundance; either user-supplied or the 75th percentile of non-zero `pred_mean` values (echoed from input) |
+#
+# Argument: hex_summary       Output of `summarize_hex()` (or equivalent `sf` with
+#   columns `n_surveys`, `mean_count_per_effort`, `obs_detected`,
+#   `pred_mean`, `pred_detected`).
+# Argument: absence_threshold      Numeric scalar. Hexagons with `pred_mean` at
+#   or below this value (or with no raster coverage, i.e. `pred_mean` is NA)
+#   are considered model-predicted absent when computing
+#   `prop_det_in_pred_absent`. Default `0`.
+# Argument: high_abundance_threshold  Numeric scalar or `NULL`. Hexagons with
+#   `pred_mean` at or above this value are considered high-abundance when
+#   computing `prop_absent_in_pred_high`. When `NULL` (default), the threshold
+#   is set automatically to the 75th percentile of non-zero `pred_mean` values
+#   across surveyed hexagons.
+# Returns: A one-row `data.frame` of region-wide statistics.
+compute_region_stats <- function(hex_summary,
+                                 absence_threshold       = 1e-4,
+                                 high_abundance_threshold = NULL) {
+  
+  required_cols <- c("n_surveys", "mean_count_per_effort",
+                     "obs_detected", "pred_mean", "pred_detected")
+  missing <- setdiff(required_cols, names(hex_summary))
+  if (length(missing) > 0) {
+    stop("hex_summary is missing columns: ", paste(missing, collapse = ", "),
+         "\nRun summarize_hex() first.")
+  }
+  
+  surveyed <- hex_summary |>
+    sf::st_drop_geometry() |>
+    dplyr::filter(n_surveys > 0)
+  
+  n_hex_surveyed  <- nrow(surveyed)
+  n_hex_detected  <- sum(surveyed$obs_detected, na.rm = TRUE)
+  prop_detected   <- if (n_hex_surveyed > 0) n_hex_detected / n_hex_surveyed
+  else NA_real_
+  n_surveys_total <- sum(surveyed$n_surveys, na.rm = TRUE)
+  mean_surveys_ph <- if (n_hex_surveyed > 0) n_surveys_total / n_hex_surveyed
+  else NA_real_
+  
+  # -- Correlation (requires both obs and pred to be finite) ------------------
+  cor_dat <- surveyed |>
+    dplyr::filter(is.finite(mean_count_per_effort),
+                  is.finite(pred_mean))
+  
+  cor_obs_pred <- if (nrow(cor_dat) >= 3) {
+    stats::cor(cor_dat$pred_mean, cor_dat$mean_count_per_effort,
+               use = "complete.obs", method = "pearson")
+  } else NA_real_
+  
+  cor_obs_pred_wtd <- if (nrow(cor_dat) >= 3 &&
+                          sum(cor_dat$n_surveys, na.rm = TRUE) > 0) {
+    x  <- cor_dat$pred_mean
+    y  <- cor_dat$mean_count_per_effort
+    w  <- cor_dat$n_surveys
+    mx <- sum(w * x) / sum(w)
+    my <- sum(w * y) / sum(w)
+    cov_xy <- sum(w * (x - mx) * (y - my)) / sum(w)
+    var_x  <- sum(w * (x - mx)^2) / sum(w)
+    var_y  <- sum(w * (y - my)^2) / sum(w)
+    cov_xy / sqrt(var_x * var_y)
+  } else NA_real_
+  
+  # -- Presence / absence agreement -------------------------------------------
+  pa_dat <- surveyed |>
+    dplyr::filter(!is.na(obs_detected), !is.na(pred_detected))
+  
+  n_pa   <- nrow(pa_dat)
+  tp     <- sum( pa_dat$obs_detected &  pa_dat$pred_detected, na.rm = TRUE)
+  tn     <- sum(!pa_dat$obs_detected & !pa_dat$pred_detected, na.rm = TRUE)
+  fp     <- sum(!pa_dat$obs_detected &  pa_dat$pred_detected, na.rm = TRUE)
+  fn     <- sum( pa_dat$obs_detected & !pa_dat$pred_detected, na.rm = TRUE)
+  
+  pa_agreement   <- if (n_pa > 0) (tp + tn) / n_pa       else NA_real_
+  pa_sensitivity <- if ((tp + fn) > 0) tp / (tp + fn)    else NA_real_
+  pa_specificity <- if ((tn + fp) > 0) tn / (tn + fp)    else NA_real_
+  
+  # -- Detections in model-predicted absent hexagons --------------------------
+  # Numerator:   surveyed hexagons where the species was detected AND
+  #              pred_mean is at or below absence_threshold (or NA, meaning
+  #              no raster coverage -- the model implicitly predicts absence).
+  # Denominator: all surveyed hexagons where the species was detected.
+  # Interpretation: a high value flags a systematic model blind spot --
+  # the species is frequently found in places the model considers absent.
+  pred_absent <- is.na(surveyed$pred_mean) |
+    surveyed$pred_mean <= absence_threshold
+  
+  n_det_in_pred_absent    <- sum(surveyed$obs_detected & pred_absent,
+                                 na.rm = TRUE)
+  prop_det_in_pred_absent <- if (n_hex_detected > 0)
+    n_det_in_pred_absent / n_hex_detected
+  else NA_real_
+  
+  # -- Non-detections in model-predicted high-abundance hexagons --------------
+  # Threshold: default to the 75th percentile of non-zero pred_mean values
+  # across surveyed hexagons; user may supply an explicit override.
+  # Numerator:   surveyed hexagons where the species was NOT detected AND
+  #              pred_mean >= high_abundance_threshold.
+  # Denominator: all surveyed hexagons where pred_mean >= high_abundance_threshold.
+  # Interpretation: a high value means the model is confidently predicting
+  # presence in places where observers are not finding the species.
+  nonzero_preds <- surveyed$pred_mean[is.finite(surveyed$pred_mean) &
+                                        surveyed$pred_mean > 0]
+  
+  if (is.null(high_abundance_threshold)) {
+    high_abundance_threshold <- if (length(nonzero_preds) >= 4)
+      as.numeric(stats::quantile(nonzero_preds, probs = 0.75, na.rm = TRUE))
+    else NA_real_
+  }
+  
+  if (is.finite(high_abundance_threshold)) {
+    pred_high      <- is.finite(surveyed$pred_mean) &
+      surveyed$pred_mean >= high_abundance_threshold
+    n_pred_high    <- sum(pred_high, na.rm = TRUE)
+    n_absent_in_pred_high    <- sum(!surveyed$obs_detected & pred_high,
+                                    na.rm = TRUE)
+    prop_absent_in_pred_high <- if (n_pred_high > 0)
+      n_absent_in_pred_high / n_pred_high
+    else NA_real_
+  } else {
+    high_abundance_threshold  <- NA_real_
+    prop_absent_in_pred_high  <- NA_real_
+  }
+  
+  data.frame(
+    n_hex_surveyed           = n_hex_surveyed,
+    n_hex_detected           = n_hex_detected,
+    prop_hex_detected        = prop_detected,
+    n_surveys_total          = n_surveys_total,
+    mean_surveys_per_hex     = mean_surveys_ph,
+    cor_obs_pred             = cor_obs_pred,
+    cor_obs_pred_wtd         = cor_obs_pred_wtd,
+    pa_agreement             = pa_agreement,
+    pa_sensitivity           = pa_sensitivity,
+    pa_specificity           = pa_specificity,
+    prop_det_in_pred_absent  = prop_det_in_pred_absent,
+    absence_threshold        = absence_threshold,
+    prop_absent_in_pred_high = prop_absent_in_pred_high,
+    high_abundance_threshold = high_abundance_threshold
+  )
+}
+
+# -- Panel A: raw raster -------------------------------------------------------
+
+# Plot model-predicted relative abundance as a raster layer
+#
+# Pixels with a value of 0 or NA are rendered as transparent (absent).
+# All non-zero pixels are mapped onto the colour ramp, with the upper end
+# capped at the `rast_max_q` quantile to prevent outliers from compressing
+# the scale.
+#
+# Argument: rast         A `SpatRaster`. Absent cells should be 0 or NA.
+# Argument: study_area   `sf` polygon defining the region boundary.
+# Argument: rast_max_q   Quantile (0-1) used to cap the upper end of the colour
+#   scale. Default `0.99`.
+# Argument: palette      Character vector of colours (auto if NULL).
+# Argument: transform    Scale transform: `"identity"`, `"sqrt"`, `"log"`, etc.
+# Returns: A `ggplot` object.
+plot_raster_gg <- function(rast,
+                           study_area,
+                           region_boundaries = NULL,
+                           rast_max_q = 1,
+                           rast_max   = NULL,
+                           rast_min   = NULL,
+                           palette    = NULL,
+                           transform  = "identity",
+                           clipped    = FALSE) {   # TRUE: rast already cropped/masked to study_area
+  
+  stopifnot(inherits(rast, "SpatRaster"))
+  stopifnot(inherits(study_area, "sf"))
+  
+  if (is.null(palette)) {
+    palette <- grDevices::colorRampPalette(c(
+      "#FBF7E2", "#FCF8D0", "#EEF7C2", "#CEF2B0",
+      "#94E5A0", "#51C987", "#18A065", "#008C59",
+      "#007F53", "#006344"
+    ))(100)
+  }
+  
+  plot_crs <- sf::st_crs(study_area)
+  
+  # Reproject only when the CRS actually differs (a same-CRS project() is a full
+  # resample), and skip crop/mask when the caller already clipped the raster.
+  if (!terra::same.crs(rast, plot_crs$wkt)) {
+    rast    <- terra::project(rast, plot_crs$wkt)
+    clipped <- FALSE
+  }
+  if (!isTRUE(clipped)) {
+    study_vect <- terra::vect(study_area)
+    rast <- terra::mask(terra::crop(rast, study_vect), study_vect)
+  }
+  
+  # Blank out absent pixels (0 or NA to NA so they render as transparent)
+  rast[rast <= 0] <- NA
+  
+  # Cap the upper end of the scale. The cap can be either an explicit
+  # maximum or a quantile-derived maximum.
+  r_max <- resolve_rast_max(
+    rast       = rast,
+    rast_max   = rast_max,
+    rast_max_q = rast_max_q
+  )
+  rast <- terra::clamp(rast, upper = r_max, values = TRUE)
+  
+  # Lower end of the colour scale. Absent pixels were set to NA upstream
+  # (values at or below the absence floor), so the faintest palette colour is
+  # anchored to the lowest *present* density rather than to 0. This uses the
+  # full ramp -- including the pale low end -- instead of compressing every
+  # present pixel into the dark upper colours. A shared value can be supplied
+  # via `rast_min` so paired (e.g. two-period) panels use an identical scale;
+  # otherwise it is derived from this raster's surviving values.
+  if (!is.null(rast_min) && is.finite(rast_min)) {
+    r_min <- rast_min
+  } else {
+    present_vals <- terra::values(rast, mat = FALSE)
+    present_vals <- present_vals[is.finite(present_vals) & present_vals > 0]
+    r_min <- if (length(present_vals)) min(present_vals) else 0
+  }
+  if (!is.finite(r_min) || r_min >= r_max) r_min <- 0
+  
+  rast_df           <- as.data.frame(rast, xy = TRUE, na.rm = FALSE)
+  names(rast_df)[3] <- "value"
+  
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_raster(data = rast_df,
+                         ggplot2::aes(x = x, y = y, fill = value)) +
+    ggplot2::geom_sf(data = study_area, fill = NA, colour = "gray30")
+  
+  if (!is.null(region_boundaries)) {
+    p <- p +
+      ggplot2::geom_sf(
+        data = region_boundaries,
+        fill = "transparent",
+        colour = "gray30"
+      )
+  }
+  
+  p +
+    ggspatial::annotation_scale(location = "br", width_hint = 0.25) +
+    ggspatial::annotation_north_arrow(
+      location    = "tr",
+      which_north = "true",
+      style       = ggspatial::north_arrow_fancy_orienteering
+    ) +
+    ggplot2::scale_fill_gradientn(
+      colours  = palette,
+      limits   = c(r_min, r_max),
+      oob      = scales::squish,
+      na.value = "transparent",  # absent pixels show panel background through
+      trans    = transform,
+      name     = "Relative abundance"
+    ) +
+    ggplot2::coord_sf() +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      legend.position      = c(0.03, 0.03),
+      legend.justification = c(0, 0),
+      legend.background    = ggplot2::element_rect(fill = "white", colour = NA),
+      legend.margin        = ggplot2::margin(4, 4, 4, 4),
+      legend.box.margin    = ggplot2::margin(6, 6, 6, 6),
+      plot.background      = ggplot2::element_rect(fill = "white", colour = "black",
+                                                   linewidth = 0.5),
+      panel.background     = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.title    = ggplot2::element_text(size = 14, face = "bold", hjust = 0),
+      plot.subtitle = ggplot2::element_text(size = 12, hjust = 0,
+                                            margin = ggplot2::margin(b = 6))
+    ) +
+    ggplot2::labs(title = "Model predictions")
+}
+
+
+# -- Panel C: honeycomb effort/detection map -----------------------------------
+
+# Plot a honeycomb survey-effort / detection map
+#
+# Fills hexagons by survey effort (number of visits) and overlays circles
+# scaled by observed mean count per effort.
+#
+# Argument: hex_summary          Output of `summarize_hex()` (or
+#   `summarize_surveys_by_hex()`).
+# Argument: study_area           `sf` polygon.
+# Argument: water                Optional `sf` water polygons.
+# Argument: max_surveys          Upper bound for effort colour classes (auto).
+# Argument: max_count_per_effort Upper bound for circle scaling (auto).
+# Argument: alpha_min,alpha_max  Range of hex fill transparency.
+# Argument: hex_fill             Fill colour for hexagons.
+# Argument: circle_fill          Fill colour for detection circles.
+# Argument: water_fill           Fill colour for water polygons.
+# Returns: A `ggplot` object.
+# Raw survey/square tallies for one region+period honeycomb panel.
+# sp_dat is the per-survey sf the honeycomb displays (already filtered to the
+# region and atlas period), carrying `count` and `square_id` (10-km atlas
+# square). Detection is count > 0; surveys with an NA square_id still count as
+# surveys but are dropped from the square tallies. Returns the named list
+# consumed by plot_honeycomb(survey_counts = ).
+survey_detection_counts <- function(sp_dat) {
+  stopifnot(inherits(sp_dat, "sf") || is.data.frame(sp_dat))
+  stopifnot(all(c("count", "square_id") %in% names(sp_dat)))
+
+  count     <- sp_dat$count
+  square_id <- sp_dat$square_id
+  detected  <- is.finite(count) & count > 0
+  has_sq    <- !is.na(square_id)
+
+  list(
+    n_surveys          = length(count),
+    n_surveys_detected = sum(detected, na.rm = TRUE),
+    n_squares          = dplyr::n_distinct(square_id[has_sq]),
+    n_squares_detected = dplyr::n_distinct(square_id[has_sq & detected])
+  )
+}
+
+plot_honeycomb <- function(hex_summary,
+                           study_area,
+                           region_boundaries    = NULL,
+                           water                = NULL,
+                           max_surveys          = NULL,
+                           max_surveys_q        = 0.80,
+                           max_count_per_effort = NULL,
+                           max_count_per_effort_q = 0.99,
+                           alpha_min            = 0.15,
+                           alpha_max            = 1,
+                           hex_fill             = "#B38F47", 
+                           circle_fill          = "black",
+                           water_fill           = "#b8dceb",
+                           # Text used in the panel subtitle to describe what the
+                           # circle size encodes. Defaults to raw mean count; set
+                           # to a "per survey-minute" wording when count_per_effort
+                           # is a per-minute rate (see prepare_honeycomb_surveys()).
+                           count_size_label     = "observed mean count in hexagon",
+                           # Optional named list from survey_detection_counts();
+                           # NULL omits the corner tally.
+                           survey_counts        = NULL,
+                           # Optional per-hexagon special-survey overlay: an sf on
+                           # the same hex grid carrying logical special_surveyed /
+                           # special_detected columns (summarize_special_by_hex()).
+                           # NULL (or all-FALSE) draws nothing. Special surveys have
+                           # no effort covariate, so they are shown ONLY here, not
+                           # in the effort fill or the black count circles.
+                           special_hex            = NULL,
+                           special_colour         = "white",   # ring + x colour
+                           special_halo_colour    = NA,  # NA disables halo
+                           special_ring_frac      = 0.7,       # ring dia / hex inner dia
+                           special_ring_linewidth = 0.1,
+                           special_x_size         = 1,
+                           special_x_stroke       = 0.1,
+                           special_halo_extra     = 0.1,
+                           # Vertices per circle (ggforce default 360). Circles
+                           # are a few mm across, so 48 is visually identical
+                           # and cuts rendered vertices ~7x on every honeycomb.
+                           circle_n               = 48) {
+  
+  stopifnot(inherits(hex_summary, "sf"))
+  stopifnot(inherits(study_area, "sf"))
+  stopifnot("n_surveys" %in% names(hex_summary))
+  stopifnot("mean_count_per_effort" %in% names(hex_summary))
+  if (!is.null(special_hex)) stopifnot(inherits(special_hex, "sf"))
+
+  # Does the overlay actually have anything to show? (drives the subtitle note)
+  has_special_overlay <- !is.null(special_hex) &&
+    "special_surveyed" %in% names(special_hex) &&
+    any(special_hex$special_surveyed, na.rm = TRUE)
+  
+  water_to_plot <- NULL
+  
+  if (!is.null(water)) {
+    
+    if (inherits(water, "sf")) {
+      plot_crs <- sf::st_crs(study_area)
+      water_to_plot <- water |>
+        sf::st_transform(plot_crs) |>
+        sf::st_intersection(study_area)
+      
+    } else {
+      stop("water must be NULL or an sf object.")
+    }
+    
+  } else {
+    plot_crs <- sf::st_crs(hex_summary)
+    study_area <- sf::st_transform(study_area, plot_crs)
+  }
+  
+  max_surveys <- ceiling(resolve_positive_max(
+    x             = hex_summary$n_surveys,
+    max_value     = max_surveys,
+    max_q         = max_surveys_q,
+    default       = 1,
+    argument_name = "max_surveys"
+  ))
+  if (!is.finite(max_surveys) || max_surveys < 1) max_surveys <- 1
+  
+  max_count_per_effort <- resolve_positive_max(
+    x             = hex_summary$mean_count_per_effort,
+    max_value     = max_count_per_effort,
+    max_q         = max_count_per_effort_q,
+    default       = 1,
+    argument_name = "max_count_per_effort"
+  )
+  
+  effort_info   <- make_effort_classes(max_surveys, alpha_min, alpha_max)
+  max_surveys   <- effort_info$max_surveys
+  effort_levels <- effort_info$effort_levels
+  alpha_values  <- effort_info$alpha_values
+  
+  hex_area       <- as.numeric(sf::st_area(hex_summary))
+  inner_diameter <- 2 * sqrt(hex_area / (2 * sqrt(3)))
+  
+  hex_summary_plot <- hex_summary |>
+    dplyr::mutate(
+      n_surveys    = dplyr::coalesce(n_surveys, 0),
+      effort_class = dplyr::case_when(
+        n_surveys <= 0          ~ "0",
+        n_surveys > max_surveys ~ paste0(">", max_surveys),
+        TRUE ~ effort_info$positive_labels[
+          findInterval(n_surveys,
+                       vec = c(0, effort_info$ends),
+                       rightmost.closed = TRUE)
+        ]
+      ),
+      effort_class = factor(effort_class, levels = effort_levels)
+    )
+  
+  circle_sf <- hex_summary_plot |>
+    dplyr::mutate(
+      mean_count_per_effort = dplyr::coalesce(mean_count_per_effort, 0),
+      count_scaled  = pmin(mean_count_per_effort, max_count_per_effort) /
+        max_count_per_effort,
+      circle_diameter = dplyr::if_else(
+        mean_count_per_effort > 0 & n_surveys > 0,
+        0.1 * inner_diameter + sqrt(count_scaled) * (0.6 - 0.1) * inner_diameter,
+        0
+      ),
+      circle_radius = circle_diameter / 2
+    ) |>
+    sf::st_point_on_surface()
+  
+  xy        <- sf::st_coordinates(circle_sf)
+  circle_df <- circle_sf |>
+    sf::st_drop_geometry() |>
+    dplyr::mutate(x = xy[, 1], y = xy[, 2])
+  
+  p <- ggplot2::ggplot() +
+    ggplot2::geom_sf(data = study_area, fill = NA, colour = "gray30")
+  
+  if (!is.null(water_to_plot)) {
+    p <- p + ggplot2::geom_sf(data = water_to_plot,
+                              fill = water_fill, colour = water_fill,
+                              linewidth = 0.1)
+  }
+  
+  
+  
+  p <- p +
+    ggplot2::geom_sf(
+      data = hex_summary_plot,
+      ggplot2::aes(alpha = effort_class),
+      fill = hex_fill, colour = NA
+    )
+  
+  if (!is.null(region_boundaries)) {
+    p <- p +
+      ggplot2::geom_sf(
+        data = region_boundaries,
+        fill = "transparent",
+        colour = "gray30"
+      )
+  }
+  
+  p <- p +  
+    ggforce::geom_circle(
+      data = dplyr::filter(circle_df, circle_radius > 0),
+      ggplot2::aes(x0 = x, y0 = y, r = circle_radius),
+      alpha = 1, fill = circle_fill, colour = NA, n = circle_n
+    ) +
+    ggspatial::annotation_scale(location = "br", width_hint = 0.25) +
+    ggplot2::scale_alpha_manual(
+      name   = "Survey effort",
+      values = alpha_values,
+      drop   = FALSE,
+      guide  = ggplot2::guide_legend(override.aes = list(fill = hex_fill,
+                                                         colour = NA))
+    ) +
+    ggplot2::guides(
+      alpha = ggplot2::guide_legend(order = 1,
+                                    override.aes = list(fill = hex_fill,
+                                                        colour = NA))
+    ) +
+    ggplot2::coord_sf() +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      legend.position      = c(0.03, 0.03),
+      legend.justification = c(0, 0),
+      legend.background    = ggplot2::element_rect(fill = "white", colour = NA),
+      legend.margin        = ggplot2::margin(4, 4, 4, 4),
+      legend.box.margin    = ggplot2::margin(6, 6, 6, 6),
+      plot.background      = ggplot2::element_rect(fill = "white", colour = "black",
+                                                   linewidth = 0.5),
+      panel.background     = ggplot2::element_rect(fill = "white", colour = NA),
+      plot.title    = ggplot2::element_text(size = 14, face = "bold", hjust = 0),
+      plot.subtitle = ggplot2::element_text(size = 12, hjust = 0,
+                                            margin = ggplot2::margin(b = 6))
+    ) +
+    ggplot2::labs(
+      title    = "Relative survey effort",
+      subtitle = paste(
+        c(
+          "Hex fill = Number of surveys in hexagon",
+          paste0("Circle size = ", count_size_label),
+          if (isTRUE(has_special_overlay))
+            "Special surveys: ring = surveyed, \u2715 = detected"
+        ),
+        collapse = "\n"
+      )
+    )
+
+  # -- Special-survey overlay: occurrence ring + detection x --------------------
+  # Special (targeted) surveys have no effort covariate, so they are absent from
+  # the effort fill and the black count circles. Drawn AFTER those circles (so
+  # they sit on top): an unfilled ring marks hexes where a special survey
+  # occurred; an "x" marks hexes where the species was detected by one. Each mark
+  # gets a thin dark halo so the white stays legible over pale / empty hexes.
+  if (!is.null(special_hex) && nrow(special_hex) > 0) {
+    if (sf::st_crs(special_hex) != plot_crs) {
+      special_hex <- sf::st_transform(special_hex, plot_crs)
+    }
+    for (col in c("special_surveyed", "special_detected")) {
+      if (!col %in% names(special_hex)) special_hex[[col]] <- FALSE
+      special_hex[[col]] <- dplyr::coalesce(special_hex[[col]], FALSE)
+    }
+
+    special_pts <- sf::st_point_on_surface(special_hex)
+    special_xy  <- sf::st_coordinates(special_pts)
+    special_df  <- special_hex |>
+      sf::st_drop_geometry() |>
+      dplyr::mutate(x = special_xy[, 1], y = special_xy[, 2],
+                    ring_radius = special_ring_frac * inner_diameter / 2)
+
+    ring_df <- dplyr::filter(special_df, special_surveyed)
+    det_df  <- dplyr::filter(special_df, special_detected)
+
+    # (a) occurrence ring: dark halo first, white ring on top.
+    if (nrow(ring_df) > 0) {
+      if (!is.na(special_halo_colour)) {
+        p <- p + ggforce::geom_circle(
+          data = ring_df, inherit.aes = FALSE,
+          ggplot2::aes(x0 = x, y0 = y, r = ring_radius),
+          fill = NA, colour = special_halo_colour,
+          linewidth = special_ring_linewidth + special_halo_extra, n = circle_n
+        )
+      }
+      p <- p + ggforce::geom_circle(
+        data = ring_df, inherit.aes = FALSE,
+        ggplot2::aes(x0 = x, y0 = y, r = ring_radius),
+        fill = NA, colour = special_colour,
+        linewidth = special_ring_linewidth, n = circle_n
+      )
+    }
+
+    # (b) detection x, over the centroid / black circle: dark halo then white x.
+    if (nrow(det_df) > 0) {
+      if (!is.na(special_halo_colour)) {
+        p <- p + ggplot2::geom_point(
+          data = det_df, inherit.aes = FALSE,
+          ggplot2::aes(x = x, y = y), shape = 4,
+          colour = special_halo_colour,
+          size = special_x_size, stroke = special_x_stroke + special_halo_extra
+        )
+      }
+      p <- p + ggplot2::geom_point(
+        data = det_df, inherit.aes = FALSE,
+        ggplot2::aes(x = x, y = y), shape = 4,
+        colour = special_colour,
+        size = special_x_size, stroke = special_x_stroke
+      )
+    }
+  }
+
+  # Optional top-right tally of raw effort and detections. Anchored to the
+  # study-area bbox so it sits in the corner under coord_sf, clear of the
+  # bottom-left legend, bottom-right scale bar, and top-left title.
+  if (!is.null(survey_counts)) {
+    bb      <- sf::st_bbox(study_area)
+    inset_x <- 0.005 * (bb[["xmax"]] - bb[["xmin"]])
+    inset_y <- 0.005 * (bb[["ymax"]] - bb[["ymin"]])
+
+    counts_df <- data.frame(
+      x = bb[["xmax"]] - inset_x,
+      y = bb[["ymax"]] - inset_y,
+      label = paste0(
+        "<b>Surveys</b>: ", scales::comma(survey_counts$n_surveys),
+        " (", scales::comma(survey_counts$n_surveys_detected),
+        " with detection)<br>",
+        "<b>Squares</b>: ", scales::comma(survey_counts$n_squares),
+        " (", scales::comma(survey_counts$n_squares_detected),
+        " with detection)"
+      )
+    )
+
+    p <- p +
+      ggtext::geom_richtext(
+        data = counts_df,
+        ggplot2::aes(x = x, y = y, label = label),
+        hjust = 1, vjust = 1, size = 3.2, lineheight = 1.1,
+        fill = "white", label.color = NA,
+        label.padding = grid::unit(c(3, 5, 3, 5), "pt")
+      )
+  }
+
+  p
+}
+
+# ==============================================================================
+# Panel plot helpers
+# ==============================================================================
+
+# -- Internal: effort-class breaks and alpha scale ----------------------------
+
+# Build effort-class breaks and alpha scale for the honeycomb plot
+make_effort_classes <- function(max_surveys, alpha_min, alpha_max) {
+  
+  max_surveys <- ceiling(max_surveys)
+  if (!is.finite(max_surveys) || max_surveys < 1) max_surveys <- 1
+  
+  n_positive_classes <- min(4, max_surveys)
+  
+  positive_breaks <- unique(ceiling(
+    (seq(0, 1, length.out = n_positive_classes + 1)^2) * max_surveys
+  ))
+  positive_breaks <- positive_breaks[positive_breaks > 0]
+  positive_breaks[length(positive_breaks)] <- max_surveys
+  
+  starts <- c(1, head(positive_breaks, -1) + 1)
+  ends   <- positive_breaks
+  valid  <- starts <= ends
+  starts <- starts[valid]
+  ends   <- ends[valid]
+  
+  positive_labels <- ifelse(
+    starts == ends,
+    as.character(starts),
+    paste0(starts, "-", ends)
+  )
+  
+  effort_levels <- c("0", positive_labels, paste0(">", max_surveys))
+  
+  alpha_values <- c(
+    "0" = 0,
+    setNames(
+      seq(alpha_min, alpha_max, length.out = length(positive_labels) + 1),
+      c(positive_labels, paste0(">", max_surveys))
+    )
+  )
+  
+  list(
+    max_surveys     = max_surveys,
+    starts          = starts,
+    ends            = ends,
+    positive_labels = positive_labels,
+    effort_levels   = effort_levels,
+    alpha_values    = alpha_values
+  )
+}
+
+
+# Plot region-specific estimates of population change
+make_change_comparison_plot <- function(
+    regional_estimates_FullModel,
+    paired_change_summary = NULL,
+    # South -> north up the y axis. Must contain every BCR_Label that can appear
+    # in the inputs; 09 passes its own copy so the plot and the repeated-survey
+    # table cannot drift apart.
+    region_order = c(
+      "Lower Great Lakes / St. Lawrence Plain",
+      "Temperate Mixed",
+      "Boreal Shield West",
+      "Boreal Shield East",
+      "Hudson Plains"),
+    title = "Comparison of population change estimates",
+    subtitle = "Median and 90% credible intervals"
+) {
+  
+  pct_to_logratio <- function(x) log1p(x / 100)
+  
+  pct_label <- function(x) {
+    pct <- 100 * (exp(x) - 1)
+    dplyr::case_when(
+      pct > 0  ~ paste0("+", round(pct), "%"),
+      pct == 0 ~ "0%",
+      TRUE     ~ paste0(round(pct), "%")
+    )
+  }
+  
+  x_breaks_pct <- c(-80, -50, -33, 0, 50, 100, 400)
+  x_breaks <- pct_to_logratio(x_breaks_pct)
+  
+  region_lookup <- regional_estimates_FullModel %>%
+    dplyr::select(
+      BCR = Region_Number,
+      Region_Name
+    )
+  
+  full_model_plot_df <- regional_estimates_FullModel %>%
+    dplyr::transmute(
+      BCR = Region_Number,
+      Region_Name,
+      analysis = "Full spatial model",
+      pct_change_median = pct_change_median,
+      pct_change_qlow   = pct_change_qlow,
+      pct_change_qhigh  = pct_change_qhigh
+    )
+  
+  # Paired estimates are optional. If absent, this panel simply shows the full
+  # spatial-model estimates; the driver omits the other paired-only page-3 panels.
+  has_paired_estimates <- !(is.null(paired_change_summary) || nrow(paired_change_summary) == 0)
+
+  if (!has_paired_estimates) {
+    paired_plot_df <- NULL
+  } else {
+    paired_plot_df <- paired_change_summary %>%
+      dplyr::left_join(region_lookup, by = "BCR") %>%
+      dplyr::mutate(
+        analysis = dplyr::case_when(
+          shared_radius_km == 0.1 ~ "Repeated (100 m buffer)",
+          TRUE ~ paste0("Shared footprint = ", shared_radius_km * 1000, " m")
+        )
+      ) %>%
+      dplyr::transmute(
+        BCR,
+        Region_Name,
+        analysis,
+        pct_change_median = pct_change_median,
+        pct_change_qlow   = pct_change_qlow,
+        pct_change_qhigh  = pct_change_qhigh
+      )
+  }
+  
+  plot_df <- dplyr::bind_rows(
+    full_model_plot_df,
+    paired_plot_df
+  )
+  
+  # factor() would turn an unlisted region into NA and drop it from the panel
+  # without warning. Fail loudly instead, in the same spirit as
+  # require_bcr_key(): a region silently missing from the figure is much worse
+  # than a stopped run. This is what catches a stale region_order after a BCR
+  # definition changes (e.g. the 76_77 split).
+  unknown_regions <- setdiff(
+    unique(stats::na.omit(plot_df$Region_Name)),
+    region_order
+  )
+  
+  if (length(unknown_regions) > 0) {
+    stop(
+      "Region label(s) not present in region_order: ",
+      paste(unknown_regions, collapse = ", "),
+      ". Update region_order (region_label_order in ",
+      "09_generate_model_products.R) to match the current BCR definitions.",
+      call. = FALSE
+    )
+  }
+  
+  plot_df <- plot_df %>%
+    dplyr::mutate(
+      Region_Name = factor(Region_Name, levels = region_order),
+      region_y = as.numeric(Region_Name),
+      analysis = factor(
+        analysis,
+        levels = c(
+          "Full spatial model",
+          "Repeated (100 m buffer)"
+        )
+      ),
+      y_pos = dplyr::case_when(
+        !has_paired_estimates                 ~ region_y,
+        analysis == "Full spatial model"     ~ region_y + 0.1,
+        analysis == "Repeated (100 m buffer)" ~ region_y - 0.1
+      ),
+      
+      # Transform percent change to symmetric log-ratio scale
+      x_med  = pct_to_logratio(pct_change_median),
+      x_low  = pct_to_logratio(pct_change_qlow),
+      x_high = pct_to_logratio(pct_change_qhigh)
+    )
+  
+  ggplot2::ggplot(
+    plot_df,
+    ggplot2::aes(
+      y = y_pos,
+      x = x_med,
+      xmin = x_low,
+      xmax = x_high,
+      colour = analysis
+    )
+  ) +
+    ggplot2::geom_vline(
+      xintercept = 0,
+      linewidth = 0.4,
+      linetype = "dashed",
+      colour = "grey40"
+    ) +
+    ggplot2::geom_pointrange(
+      linewidth = 1,
+      fatten = 2.5
+    ) +
+    ggplot2::scale_x_continuous(
+      breaks = x_breaks,
+      labels = pct_label
+    ) +
+    ggplot2::scale_y_continuous(
+      breaks = seq_along(region_order),
+      labels = region_order
+    ) +
+    ggplot2::scale_colour_manual(
+      values = c(
+        "Full spatial model"    = "black",
+        "Repeated (100 m buffer)"  = "#1FAA59"
+      )
+    ) +
+    ggplot2::labs(
+      x = "Estimated population change (%)",
+      y = NULL,
+      colour = "",
+      title = title,
+      subtitle = subtitle
+    ) +
+    ggplot2::theme_bw(base_size = 13) +
+    ggplot2::theme(
+      panel.grid.major.y = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank(),
+      legend.position = if (has_paired_estimates) "top" else "none",
+      plot.title = ggplot2::element_text(face = "bold")
+    )
+}
+
+make_paired_summary_table <- function(paired_data_summary,
+                                      title = "Repeated survey data summary") {
+  
+  table_df <- paired_data_summary %>%
+    dplyr::ungroup() %>%
+    dplyr::mutate(
+      Atlas = dplyr::recode(
+        Atlas,
+        OBBA2 = "Atlas 2",
+        OBBA3 = "Atlas 3"
+      ),
+      line = paste0(
+        Atlas,
+        ": mean count = ", sprintf("%.3f", mean_count),
+        "   |   PObs = ", sprintf("%.3f", PObs),
+        "   |   n_svy = ", scales::comma(n_surveys),
+        "   |   n_sq = ", scales::comma(n_squares)
+      )
+    ) %>%
+    dplyr::arrange(dplyr::desc(BCR_Label), Atlas) %>%
+    dplyr::group_by(BCR_Label) %>%
+    dplyr::summarise(
+      text = paste0(
+        "<b>", unique(BCR_Label), "</b>",
+        "<br>",
+        paste(line, collapse = "<br>")
+      ),
+      .groups = "drop"
+    ) %>%
+    dplyr::arrange(dplyr::desc(BCR_Label)) %>%
+    dplyr::mutate(
+      y = dplyr::row_number()
+    )
+  
+  ggplot2::ggplot(table_df, ggplot2::aes(x = 0, y = -y, label = text)) +
+    ggtext::geom_richtext(
+      hjust = 0,
+      vjust = 1,
+      lineheight = 1.05,
+      size = 3.2,
+      fill = NA,
+      label.color = NA
+    ) +
+    ggplot2::labs(title = title) +
+    ggplot2::coord_cartesian(
+      xlim = c(0, 1),
+      ylim = c(-max(table_df$y) - 0.2, -0.5),
+      expand = FALSE,
+      clip = "off"
+    ) +
+    ggplot2::theme_void() +
+    ggplot2::theme(
+      plot.title = ggplot2::element_text(
+        size = 13,
+        hjust = 0,
+        margin = ggplot2::margin(b = 6)
+      ),
+      plot.margin = ggplot2::margin(5, 5, 5, 5)
+    )
+}
+
+
+# ==============================================================================
+# Per-region / per-page assembly helpers
+#
+# These orchestrate the region- and page-level products consumed by
+# 09_generate_model_products.R (load_species_surveys() and require_bcr_key() are
+# also used by 08). They take all inputs as explicit arguments (no dependence on
+# script globals or the `cfg` list); numeric defaults below mirror the cfg
+# values 09 passes.
+# ==============================================================================
+
+# Region geometries + their assessment hex grids. These depend only on the
+# study area and n_hexagons, so they are constant across all species.
+make_region_geom <- function(bcr_codes, bcr_regions, study_boundary) {
+  if (is.null(bcr_codes)) {
+    return(study_boundary)
+  }
+  missing_codes <- setdiff(bcr_codes, bcr_regions$BCR)
+  if (length(missing_codes) > 0) {
+    stop("BCR code(s) not found in bcr_regions: ",
+         paste(missing_codes, collapse = ", "), call. = FALSE)
+  }
+  subset(bcr_regions, BCR %in% bcr_codes) %>%
+    sf::st_union() %>%
+    sf::st_intersection(study_boundary) %>%
+    sf::st_transform(sf::st_crs(study_boundary)) %>%
+    sf::st_as_sf()
+}
+
+
+# Reconstruct a species' survey sf from its lightweight data_used record.
+# The data_used file stores only survey_id + count; everything else (geometry,
+# Survey_Type, Atlas, BCR, square_id, ...) is rejoined from all_surveys.
+load_species_surveys <- function(dat_used, all_surveys) {
+  all_surveys %>%
+    dplyr::inner_join(dat_used$survey_counts, by = "survey_id") %>%
+    dplyr::mutate(count_per_effort = count)
+}
+
+
+# Survey_Type values, matching the labels finalized in 06_filter_and_finalize
+# _surveys.R. Structured surveys have (approximately) fixed effort; checklist
+# surveys have variable effort and are OBBA3-only. Checklist surveys are present
+# in a species' reconstructed data ONLY when checklists were fit for it, i.e.
+# script 07 was run in a checklist mode (PC_ARU_CL or PC_ARU_CL_SS).
+honeycomb_structured_types <- c("Point_Count", "ARU")
+honeycomb_checklist_types  <- c("Breeding Bird Atlas", "Linear transect")
+
+
+# Prepare a species' survey sf for the honeycomb effort/count panels.
+#
+# The honeycomb sizes its centroid circles by the per-hexagon mean of the
+# `count_per_effort` column (via summarize_surveys_by_hex() -> plot_honeycomb()).
+# This helper sets that column to a count-per-survey-minute rate for EVERY
+# retained survey:
+#
+#     count_per_effort = count / Survey_Duration_Minutes
+#
+# This is done in every mode so that:
+#   * fixed-effort point counts / ARUs and variable-effort checklists share one
+#     comparable scale (e.g. a count of 1 from a 5-min point count -> 1/5; a
+#     count of 1 from a 28-min checklist -> 1/28); and
+#   * the honeycomb circles are directly comparable between model modes when
+#     their products are reviewed side by side.
+# The honeycomb then takes the per-hexagon mean of these rates.
+#
+# Checklist surveys ("Breeding Bird Atlas", "Linear transect") are retained
+# whenever they are present. They appear in sp_surveys only when checklists were
+# fit for the species (checklist modes leave them in dat_used$survey_counts);
+# in other modes there are no checklist rows, so the type filter reduces to
+# Point_Count + ARU. Checklists are OBBA3-only, but both atlas periods are
+# normalised together (the caller splits by Atlas afterwards) so the shared
+# Atlas 2 / Atlas 3 circle scale stays comparable.
+#
+# NOTE: this rescaling affects ONLY the honeycomb circles. The relative-
+# abundance raster panels are untouched and still represent expected count per
+# 5-minute point count.
+#
+# Argument: sp_surveys  sf from load_species_surveys(); must carry Survey_Type,
+#   count, and Survey_Duration_Minutes.
+# Returns: list(
+#   data       = effort-type surveys with a count_per_effort column (count per minute),
+#   special    = special-survey rows (no effort; drawn as the overlay),
+#   per_minute = logical, always TRUE (count_per_effort is a per-minute rate)
+# )
+prepare_honeycomb_surveys <- function(sp_surveys) {
+  stopifnot(inherits(sp_surveys, "sf"))
+  stopifnot(all(c("Survey_Type", "count") %in% names(sp_surveys)))
+
+  # Effort-based types drive the honeycomb fill and the black count circles. In
+  # non-checklist modes sp_surveys holds no checklist rows, so this reduces to
+  # Point_Count + ARU.
+  keep_types <- c(honeycomb_structured_types, honeycomb_checklist_types)
+
+  # Any remaining type is a special (targeted single-protocol) survey that the SS
+  # model kept -- script 07 leaves only ABOVE-threshold special rows in
+  # survey_counts, so no explicit special-type list is needed here. Special
+  # surveys have NO effort covariate (Survey_Duration_Minutes is NA), so they are
+  # split off and shown as a separate overlay (occurrence ring + detection x)
+  # rather than as effort circles. Empty in modes without special surveys.
+  special <- sp_surveys %>%
+    dplyr::filter(!Survey_Type %in% keep_types)
+
+  out <- sp_surveys %>%
+    dplyr::filter(Survey_Type %in% keep_types)
+
+  if (!"Survey_Duration_Minutes" %in% names(out)) {
+    stop("prepare_honeycomb_surveys(): Survey_Duration_Minutes is missing; ",
+         "cannot compute count per survey-minute.", call. = FALSE)
+  }
+  # Guard applies to the effort types ONLY; special rows (NA duration) are exempt.
+  if (any(!is.finite(out$Survey_Duration_Minutes) |
+          out$Survey_Duration_Minutes <= 0)) {
+    stop("prepare_honeycomb_surveys(): non-positive or missing ",
+         "Survey_Duration_Minutes; cannot compute count per survey-minute.",
+         call. = FALSE)
+  }
+
+  out <- out %>%
+    dplyr::mutate(count_per_effort = count / Survey_Duration_Minutes)
+
+  list(data = out, special = special, per_minute = TRUE)
+}
+
+
+# Panel subtitle wording for the honeycomb circle-size legend. count_per_effort
+# from prepare_honeycomb_surveys() is always a per-minute rate; the per_minute
+# argument is retained so callers that size circles by raw counts elsewhere can
+# still request the plain-count wording.
+honeycomb_size_label <- function(per_minute = TRUE) {
+  if (isTRUE(per_minute)) {
+    "observed mean count per survey-minute in hexagon"
+  } else {
+    "observed mean count in hexagon"
+  }
+}
+
+
+# Paired summaries produced by 07b must be keyed on BCR. If a file keyed on
+# Biol_Region is found, fail loudly rather than silently mis-joining: the
+# posterior change summaries are computed per region upstream and cannot be
+# retro-fitted spatially here.
+require_bcr_key <- function(x, what, sp_english) {
+  if ("BCR" %in% names(x)) {
+    x$BCR <- as.character(x$BCR)
+    return(x)
+  }
+  if ("Biol_Region" %in% names(x)) {
+    stop(
+      "Paired summary '", what, "' for ", sp_english, " is keyed on ",
+      "Biol_Region (atlas biological regions). Rerun ",
+      "07b_fit_models_to_shared_footprint.R with BCR regions so that the ",
+      "shared change summaries are computed per BCR.",
+      call. = FALSE
+    )
+  }
+  stop("Paired summary '", what, "' for ", sp_english,
+       " has no BCR column.", call. = FALSE)
+}
+
+
+# Build the Atlas 2 + Atlas 3 assessment panels for one region.
+#
+# Rasters are pre-cropped/masked to the region and survey data are pre-filtered
+# so that the shared display limits are computed on exactly the pixels and
+# points each panel will show. For the province the region is the full study
+# boundary, so cropping is a no-op on values.
+#
+# Argument: transform  Colour-scale transform for the relative-abundance
+#                      (raster) panel, passed through to assess_region() and on
+#                      to plot_raster_gg(). One of `"identity"`, `"sqrt"`,
+#                      `"log"`, etc. Applies to both Atlas 2 and Atlas 3 panels
+#                      so their scales stay comparable.
+# Argument: region_index  Optional fast path: the region's precomputed indices
+#                      (in_col / hex_col from add_region_survey_index(), plus
+#                      mask / hex_cells from build_region_raster_index()). When
+#                      supplied, region_boundaries must already be clipped to
+#                      the region, and no vector geometry is run per species.
+#
+# Returns: list(A2 = <assess_region output>, A3 = <...>, scale_limits = <...>)
+build_period_assessments <- function(region_geom,
+                                     region_hex,
+                                     r2, r3,
+                                     A2_dat, A3_dat,
+                                     region_boundaries,
+                                     sp_english,
+                                     title_suffix = "",
+                                     colpal,
+                                     rast_max_q    = 0.99,
+                                     count_max_q   = 0.99,
+                                     max_surveys_q = 0.80,
+                                     transform     = "identity",
+                                     count_size_label = "observed mean count in hexagon",
+                                     A2_special = NULL,
+                                     A3_special = NULL,
+                                     region_index = NULL) {
+  
+  prepared <- !is.null(region_index)
+  
+  if (prepared) {
+    r2_reg <- clip_to_region_mask(r2, region_index$mask)
+    r3_reg <- clip_to_region_mask(r3, region_index$mask)
+    
+    A2_reg     <- subset_region_surveys(A2_dat, region_index)
+    A3_reg     <- subset_region_surveys(A3_dat, region_index)
+    A2_special <- subset_region_surveys(A2_special, region_index)
+    A3_special <- subset_region_surveys(A3_special, region_index)
+  } else {
+    region_vect <- terra::vect(sf::st_transform(region_geom, terra::crs(r2)))
+    
+    r2_reg <- r2 |> terra::crop(region_vect) |> terra::mask(region_vect)
+    r3_reg <- r3 |> terra::crop(region_vect) |> terra::mask(region_vect)
+    
+    # st_filter requires matching CRS; align the region to each data layer.
+    A2_reg <- sf::st_filter(
+      A2_dat, sf::st_transform(region_geom, sf::st_crs(A2_dat)),
+      .predicate = sf::st_intersects
+    )
+    A3_reg <- sf::st_filter(
+      A3_dat, sf::st_transform(region_geom, sf::st_crs(A3_dat)),
+      .predicate = sf::st_intersects
+    )
+  }
+  
+  # Survey hex summaries first so display limits reflect both atlas periods.
+  # Survey-only: the limits take the raster maximum from `rasts`. These are
+  # also handed to assess_region() so they are not recomputed there.
+  hex_col <- if (prepared) ".hex_id"
+  A2_hex  <- summarize_surveys_by_hex(dat = A2_reg, hex_grid = region_hex, hex_col = hex_col)
+  A3_hex  <- summarize_surveys_by_hex(dat = A3_reg, hex_grid = region_hex, hex_col = hex_col)
+  
+  lims <- compute_assessment_scale_limits(
+    hex_summaries = list(A2_hex, A3_hex),
+    rasts         = list(r2_reg, r3_reg),
+    rast_max_q    = rast_max_q,
+    count_max_q   = count_max_q,
+    max_surveys_q = max_surveys_q
+  )
+  
+  # Shared lower bound for the relative-abundance colour ramp: the faintest
+  # present (non-absent) density across BOTH periods. Absent pixels are already
+  # NA (values at or below the absence floor set upstream), so this is the lower
+  # edge of 'present'. Sharing it keeps the two period panels on an identical
+  # scale and lets the pale low end of the palette be used.
+  present_min <- function(r) {
+    v <- terra::values(r, mat = FALSE)
+    v <- v[is.finite(v) & v > 0]
+    if (length(v)) min(v) else NA_real_
+  }
+  rast_min_shared <- suppressWarnings(
+    min(c(present_min(r2_reg), present_min(r3_reg)), na.rm = TRUE)
+  )
+  if (!is.finite(rast_min_shared)) rast_min_shared <- NULL
+  
+  title_for <- function(period) {
+    if (nzchar(title_suffix)) {
+      paste0(sp_english, " - ", period, " - ", title_suffix)
+    } else {
+      paste0(sp_english, " - ", period)
+    }
+  }
+  
+  assess_one <- function(period, dat, rast, special, hex_obs) {
+    assess_region(
+      region               = region_geom,
+      region_boundaries    = region_boundaries,
+      sp_dat               = dat,
+      rast                 = rast,
+      hex_grid             = region_hex,
+      water                = NULL,
+      rast_max             = lims$rast_max,
+      rast_min             = rast_min_shared,
+      max_count_per_effort = lims$max_count_per_effort,
+      max_surveys          = lims$max_surveys,
+      transform            = transform,
+      title                = title_for(period),
+      model_source         = NULL,
+      data_source          = NULL,
+      color_palette        = colpal,
+      count_size_label     = count_size_label,
+      special_dat          = special,
+      region_index         = region_index,
+      hex_obs              = hex_obs
+    )
+  }
+  
+  list(
+    A2           = assess_one("Atlas 2", A2_reg, r2_reg, A2_special, A2_hex),
+    A3           = assess_one("Atlas 3", A3_reg, r3_reg, A3_special, A3_hex),
+    scale_limits = lims
+  )
+}
+
+
+# Build the Atlas 2 + Atlas 3 *honeycomb-only* panels for one region.
+#
+# Used for species without a fitted model: there is no prediction raster, so the
+# observed survey hex summary is rendered on its own (effort + observed mean
+# count) via plot_honeycomb(). Atlas 2 and Atlas 3 share effort/count scaling so
+# the two periods are directly comparable.
+#
+# Returns: list(A2 = <ggplot>, A3 = <ggplot>)
+build_period_honeycombs <- function(region_geom,
+                                    region_hex,
+                                    region_bounds,
+                                    A2_dat, A3_dat,
+                                    sp_english,
+                                    title_suffix  = "",
+                                    max_surveys_q = 0.80,
+                                    count_max_q   = 0.99,
+                                    count_size_label = "observed mean count in hexagon",
+                                    A2_special = NULL,
+                                    A3_special = NULL,
+                                    region_index = NULL) {   # fast path, as in build_period_assessments()
+  
+  region_filter <- function(dat) {
+    if (is.null(dat)) return(NULL)
+    if (!is.null(region_index)) return(subset_region_surveys(dat, region_index))
+    sf::st_filter(dat, sf::st_transform(region_geom, sf::st_crs(dat)),
+                  .predicate = sf::st_intersects)
+  }
+  hex_col <- if (!is.null(region_index)) ".hex_id"
+  
+  A2_reg <- region_filter(A2_dat)
+  A3_reg <- region_filter(A3_dat)
+
+  # Special-survey rows for this region (overlay only), then per-hex flags.
+  A2_special_hex <- summarize_special_by_hex(region_filter(A2_special), region_hex, hex_col = hex_col)
+  A3_special_hex <- summarize_special_by_hex(region_filter(A3_special), region_hex, hex_col = hex_col)
+  
+  # Survey-only hex summaries (no raster involved).
+  A2_hex <- summarize_surveys_by_hex(dat = A2_reg, hex_grid = region_hex, hex_col = hex_col)
+  A3_hex <- summarize_surveys_by_hex(dat = A3_reg, hex_grid = region_hex, hex_col = hex_col)
+  
+  # Shared scaling across both atlas periods. compute_assessment_scale_limits()
+  # cannot be used here (it requires a pred_mean column when no raster is given),
+  # so the two honeycomb limits are resolved directly with the same helper and
+  # quantiles that plot_honeycomb / assess_region use.
+  shared_max_surveys <- ceiling(resolve_positive_max(
+    x = c(A2_hex$n_surveys, A3_hex$n_surveys),
+    max_q = max_surveys_q, default = 1, argument_name = "max_surveys"
+  ))
+  shared_max_count <- resolve_positive_max(
+    x = c(A2_hex$mean_count_per_effort, A3_hex$mean_count_per_effort),
+    max_q = count_max_q, default = 1, argument_name = "max_count_per_effort"
+  )
+  
+  A2_counts <- survey_detection_counts(A2_reg)
+  A3_counts <- survey_detection_counts(A3_reg)
+
+  honey_one <- function(hex_obs, period, survey_counts, special_hex) {
+    plot_honeycomb(
+      hex_summary            = hex_obs,
+      study_area             = region_geom,
+      region_boundaries      = region_bounds,
+      water                  = NULL,
+      max_surveys            = shared_max_surveys,
+      max_surveys_q          = max_surveys_q,
+      max_count_per_effort   = shared_max_count,
+      max_count_per_effort_q = count_max_q,
+      count_size_label       = count_size_label,
+      survey_counts          = survey_counts,
+      special_hex            = special_hex
+    ) +
+      # Replace plot_honeycomb's generic title with the atlas period; its
+      # descriptive subtitle (hex fill / circle size) is retained.
+      ggplot2::labs(title = period)
+  }
+  
+  list(
+    A2 = honey_one(A2_hex, "Atlas 2", A2_counts, A2_special_hex),
+    A3 = honey_one(A3_hex, "Atlas 3", A3_counts, A3_special_hex)
+  )
+}
+
+
+# Render a single ggplot/patchwork page to a PNG.
+save_page <- function(plot, path,
+                      width  = 20,
+                      height = 10,
+                      res    = 300) {
+  ragg::agg_png(
+    filename = path, width = width, height = height,
+    units = "in", res = res, background = "white"
+  )
+  on.exit(grDevices::dev.off(), add = TRUE)
+  print(plot)
+  invisible(path)
+}
+
+# Write a list of page plots to one multi-page PDF.
+#
+# engine = "png"   render each page to a PNG with
+#                  save_page(), then bind the PNGs into a PDF with magick. Keeps
+#                  the per-page PNGs, but rasterises every page at `res` and
+#                  re-encodes ~18-megapixel images in magick.
+# engine = "cairo" print every page straight into one cairo_pdf device. Raster
+#                  layers are embedded as images, vector layers stay vector; no
+#                  PNGs are written. Usually several times faster.
+save_pdf_pages <- function(plots,
+                           pdf_path,
+                           png_paths = NULL,
+                           width     = 20,
+                           height    = 10,
+                           res       = 300,
+                           engine    = c("png", "cairo")) {
+  engine <- match.arg(engine)
+  
+  if (engine == "cairo") {
+    grDevices::cairo_pdf(filename = pdf_path, width = width, height = height,
+                         onefile = TRUE, bg = "white")
+    on.exit(grDevices::dev.off(), add = TRUE)
+    for (pl in plots) print(pl)
+    return(invisible(pdf_path))
+  }
+  
+  stopifnot(length(png_paths) == length(plots))
+  for (k in seq_along(plots)) {
+    save_page(plots[[k]], png_paths[k], width = width, height = height, res = res)
+  }
+  magick::image_write(magick::image_read(png_paths), path = pdf_path, format = "pdf")
+  invisible(pdf_path)
+}

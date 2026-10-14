@@ -1,0 +1,30 @@
+# Outputs: survey locations and derived data; never commit
+data_clean/
+
+# Per-user settings (ONTARIO_ATLAS_DATA, NATURECOUNTS_USER)
+.Renviron
+
+# RStudio / R session files
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+
+# Safety net: raw or derived data files must not enter the repo
+*.rds
+*.RData
+*.rda
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+*.tif
+*.tiff
+*.xlsx
+*.xls
+*.csv
+*.gpkg
+*.pdf

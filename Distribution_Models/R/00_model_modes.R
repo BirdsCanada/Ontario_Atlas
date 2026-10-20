@@ -40,7 +40,8 @@ MIN_SQUARES_PER_ATLAS <- 20
 # Must be a subset of SPECIAL_SURVEY_TYPES retained by 06 (checked there).
 MODEL_SPECIAL_SURVEY_TYPES <- c(
   "Eastern Screech-Owl Survey", "Long-eared Owl Survey", "Marshbird Survey",
-  "Nightjar Survey Protocol",   "Central Ontario Owls",  "Northern Hawk Owl Survey"
+  "Nightjar Survey Protocol",   "Central Ontario Owls",  "Northern Hawk Owl Survey",
+  "Northern Ontario Owls"
 )
 
 # One threshold (atlas squares with a detection) for every special type, or a

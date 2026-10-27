@@ -10,6 +10,8 @@ execute:
   echo: false
   warning: false
   message: false
+editor_options: 
+  chunk_output_type: console
 ---
 
 
@@ -23,9 +25,14 @@ eccc_core <-
   "c:/users/hoped/OneDrive - EC-EC/Avian_Core_20251124.xlsx" |>
   readxl::read_excel()
 
-soc_groups <- read_csv("SOCB_Report_Groups_2024.csv")
+atlas_groups <- read_csv("Data/species groupings.csv") |> 
+  pivot_longer(cols = -c(1:3), names_to = "Group", values_to = "ingroup") |> 
+  janitor::clean_names() |> 
+  filter(!is.na(ingroup)) |> 
+  mutate(species_name_model = str_to_lower(str_replace_all(english_common_name,
+                                                           "\\'|-|\\s", "_")))
 paired_sum <- read_rds(
-  "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries.rds"
+  "C:/Users/HopeD/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries.rds"
 ) |>
   transpose() |>
   pluck("shared_change_summary") |>
@@ -34,8 +41,9 @@ paired_sum <- read_rds(
 
 paired_sum_aru <-
   read_rds(
-    "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries_with_ARU.rds"
-  ) |>
+    "C:/Users/HopeD/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries_with_ARU.rds") |> 
+        # "C:/Users/HopeD/Documents/TMP_A3_SHINY_DEP/RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries_with_ARU.rds"
+  # ) |>
   transpose() |>
   pluck("shared_change_summary") |>
   list_rbind() |>
@@ -46,47 +54,50 @@ paired <- bind_rows(paired_sum, paired_sum_aru) |>
   mutate(
     pct_change_median = pct_change_q50,
     pct_change_qlow = pct_change_q10,
-    pct_change_qhigh = pct_change_q90
-  )
+    pct_change_qhigh = pct_change_q90,
+    ci_level = 0.9) 
 
 sg <- distinct(
-  soc_groups[soc_groups$include...4 == 'Y', ],
-  english_name,
-  Group
+  # soc_groups[soc_groups$include...4 == 'Y', ],
+  atlas_groups,
+  english_common_name,
+  group, species_name_model
 ) |>
   mutate(
     sp_english = case_when(
-      english_name == "Herring Gull" ~ "American Herring Gull",
-      english_name == "Warbling Vireo" ~ "Eastern Warbling Vireo",
-      english_name ==
+      english_common_name == "Herring Gull" ~ "American Herring Gull",
+      english_common_name == "Warbling Vireo" ~ "Eastern Warbling Vireo",
+      english_common_name ==
         "Golden-winged x Blue-winged Warbler" ~ "Golden-winged/Blue-winged Warbler",
-      english_name == "Whimbrel" ~ "Hudsonian Whimbrel",
-      english_name == "House Wren" ~ "Northern House Wren",
-      english_name == "Yellow Warbler" ~ "Northern Yellow Warbler",
-      str_detect(english_name, "Rock Pigeon") ~ "Rock Pigeon (Feral Pigeon)",
-      str_detect(english_name, "Redpoll") ~ "Redpoll",
-      TRUE ~ english_name
+      english_common_name == "Whimbrel" ~ "Hudsonian Whimbrel",
+      english_common_name == "House Wren" ~ "Northern House Wren",
+      english_common_name == "Yellow Warbler" ~ "Northern Yellow Warbler",
+      str_detect(english_common_name, "Rock Pigeon") ~ "Rock Pigeon (Feral Pigeon)",
+      str_detect(english_common_name, "Redpoll") ~ "Redpoll",
+      TRUE ~ english_common_name
     )
   )
 
 d_change_models <-
   list.files(
-    "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output",
+    "C:/Users/HopeD/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/",
     "regional_change_estimates\\w+.rds",
     recursive = T,
     full.names = T
   ) |>
-  str_subset("_PC_ARU_SS", negate = T) |>
+  str_subset("_PC_ARU_CL_SS", negate = F) |>
   map(read_rds) |>
   list_rbind() |> 
-  filter(model_name != "PC_ARU_CL") 
+  # filter(model_name != "PC_ARU_CL") |> 
+     mutate(pct_change_se=(pct_change_qhigh-pct_change_mean)/qnorm(ci_level)) |> 
+  filter(sufficient_data)
 
-mod_ss <- d_change_models[d_change_models$model_name=="PC_ARU_CL_SS",]
-d_change_models <- 
-  bind_rows(
-    mod_ss,
-    filter(d_change_models, model_name=="PC_ARU" & sp_english %notin% mod_ss$sp_english )
-  )
+# mod_ss <- d_change_models[d_change_models$model_name=="PC_ARU_CL_SS",]
+# d_change_models <- 
+#   bind_rows(
+#     mod_ss,
+#     filter(d_change_models, model_name=="PC_ARU" & sp_english %notin% mod_ss$sp_english )
+#   )|> mutate(pct_change_se=(pct_change_qhigh-pct_change_mean)/qnorm(ci_level))
 
 
 
@@ -124,7 +135,7 @@ d_change_gr <- d_change |>
     sg,
     by = join_by(sp_english)
   ) |>
-  replace_na(list(Group = "None"))
+  replace_na(list(group = "None"))
 
 
 plot_spp <- function(df) {
@@ -143,7 +154,7 @@ plot_spp <- function(df) {
     theme_minimal() +
     scale_x_discrete(guide = guide_axis(angle = 45)) +
     labs(y = "Median % Change between atlas 2 and 3", x = NULL) +
-    facet_wrap(~Group)
+    facet_wrap(~group)
 }
 ```
 
@@ -153,8 +164,9 @@ plot_spp <- function(df) {
 #| fig-width: 10
 #| fig-height: 8
 d_change_gr |>
-  filter(Region_Name == "Province-wide") |>
-  ggplot(aes(Group, pct_change_median)) +
+  filter(Region_Name == "Province-wide" & group!="None" &
+           model_name=="PC_ARU_CL_SS") |>
+  ggplot(aes(group, pct_change_median)) +
   geom_hline(yintercept = 0, linetype = 2) +
   # geom_line(aes(group = sp_english), alpha = 0.2)
   # geom_point() +
@@ -167,18 +179,19 @@ d_change_gr |>
   scale_x_discrete(guide = guide_axis(angle = 45)) +
   labs(y = "Median % Change between atlas 2 and 3") +
   geom_text(data =d_change_gr |>
-  filter(Region_Name == "Province-wide") |>
-  count(Group), aes(Group, 200, label = n) )
+  filter(Region_Name == "Province-wide" & group!="None" &
+           model_name=="PC_ARU_CL_SS") |>
+  count(group), aes(group, 80, label = n) )
 ```
 
 
 ```{r}
 d_change_gr |>
-  filter(Region_Name == "Province-wide") |>
-  ggplot(aes(Group, pct_change_median)) +
+  filter(Region_Name == "Province-wide"& group!="None") |>
+  ggplot(aes(group, pct_change_median)) +
   geom_hline(yintercept = 0, linetype = 2) +
  geom_pointrange(aes(ymin=pct_change_qlow ,ymax= pct_change_qhigh),
- position=position_jitter(width=0.2, height=0)) +
+ position=position_jitter(width=0.2, height=0), alpha = 0.3) +
 
   theme_minimal() +
   scale_x_discrete(guide = guide_axis(angle = 45)) +
@@ -190,8 +203,9 @@ d_change_gr |>
 #| fig-height: 8
 
 d_change_gr |>
-  filter(Region_Name != "Province-wide") |>
-  ggplot(aes(Group, pct_change_median)) +
+  filter(Region_Name != "Province-wide"& group!="None" &
+           model_name =="PC_ARU_CL_SS" ) |>
+  ggplot(aes(group, pct_change_median)) +
   geom_hline(yintercept = 0, linetype = 2) +
   # geom_line(aes(group = sp_english), alpha = 0.2)
   # geom_point() +
@@ -214,7 +228,7 @@ d_change_gr |>
 #| fig-width: 10
 #| fig-height: 8
 d_change_gr |>
-  filter(Region_Name == "Province-wide" & Group == "Grassland Birds") |>
+  filter(Region_Name == "Province-wide" & group == "Grassland Birds") |>
   plot_spp()
 ```
 
@@ -223,7 +237,7 @@ d_change_gr |>
 #| fig-width: 10
 #| fig-height: 8
 d_change_gr |>
-  filter(Region_Name == "Province-wide" & Group == "Shorebirds") |>
+  filter(Region_Name == "Province-wide" & group == "Shorebirds") |>
   plot_spp()
 ```
 
@@ -232,7 +246,7 @@ d_change_gr |>
 #| fig-width: 10
 #| fig-height: 8
 d_change_gr |>
-  filter(Region_Name == "Province-wide" & Group == "None") |>
+  filter(Region_Name == "Province-wide" & group == "None") |>
   plot_spp()
 ```
 
@@ -243,9 +257,9 @@ d_change_gr |>
 #| fig-width: 12
 
 d_change_gr |>
-  filter(Region_Name != "Province-wide" & Group == "Aerial Insectivores" & str_detect(model_name, "Paired", negate=T)) |>
+  filter(Region_Name != "Province-wide" & group == "Aerial Insectivores" & str_detect(model_name, "Paired", negate=T)) |>
   plot_spp() +
-  facet_grid(fc_region ~ Group, scale='free_y') 
+  facet_grid(fc_region ~ group, scale='free_y') 
 ```
 
 
@@ -268,7 +282,7 @@ d_change |>
     aes(
       ymin = pct_change_qlow,
       ymax = pct_change_qhigh,
-      colour = model_name
+      # colour = model_name
     ),
     position = position_dodge(width = 0.3)
   ) +
@@ -293,7 +307,7 @@ d_change |>
     aes(
       ymin = pct_change_qlow,
       ymax = pct_change_qhigh,
-      colour = model_name
+      # colour = model_name
     ),
     position = position_dodge(width = 0.3)
   ) +
@@ -328,7 +342,7 @@ d_change |>
     aes(
       ymin = pct_change_qlow,
       ymax = pct_change_qhigh,
-      colour = model_name
+      # colour = model_name
     ),
     position = position_dodge(width = 0.5)
   ) +
@@ -413,7 +427,7 @@ d_change_gr |>
       )
     )
   ) |>
-  ggplot(aes(fc_region, pct_change_median, group = Group)) +
+  ggplot(aes(fc_region, pct_change_median, group = group)) +
   stat_summary(
     # fun.data = 'mean_cl_boot',
     fun = 'mean',
@@ -434,7 +448,7 @@ d_change_gr |>
 #| fig-height: 8
 #| eval: false
 d_change |>
-  filter(model_name == "PC_ARU") |>
+  # filter(model_name == "PC_ARU") |>
   select(fc_region, sp_english, pct_change_median) |>
   pivot_wider(names_from = fc_region, values_from = pct_change_median) |>
   filter(`Lower Great Lakes / St. Lawrence Plain` < 0 & `Hudson Plains` > 0) |>
@@ -449,7 +463,7 @@ gen_dist <- function(spp_code, model_name) {
   # browser()
   f_ <- list.files(
     glue::glue(
-      "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/rasters_{model_name}/"
+      "../RAW_DATA/ATLAS_RAW_DATA/Ontario_A3_Rasters_counts_figs/rasters_{model_name}/"
     ),
     glue::glue("^{spp_code}_a\\d.tif"),
     full.names = T
@@ -495,11 +509,11 @@ gen_dist <- function(spp_code, model_name) {
 
 all_mods <-
   map(
-    c("PC_ARU", "PC_ARU_CL", "PC_ARU_CL_SS"),
+    c( "PC_ARU_CL_SS"),
     ~ {
       rast_og <- list.files(
         glue::glue(
-          "RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/rasters_{.x}/"
+          "../RAW_DATA/ATLAS_RAW_DATA/Ontario_A3_Rasters_counts_figs/rasters_{.x}/"
         ),
         "_a\\d.tif"
       )
@@ -515,8 +529,8 @@ all_mods <-
 # future::plan(future::multisession(workers = 12))
 # all_spp_res <- pmap(all_mods, gen_dist) |> futurize::futurize()
 # future::plan(future::sequential())
-# write_rds(all_spp_res, "RAW_DATA/Raw_species_res_distance.rds")
-all_spp_res <-read_rds( "RAW_DATA/Raw_species_res_distance.rds")
+# write_rds(all_spp_res, "../RAW_DATA/Raw_species_res_distance2.rds")
+all_spp_res <-read_rds( "..RAW_DATA/Raw_species_res_distance2.rds")
 
 # gen_dist("blue_winged_warbler", "PC_ARU")
 
@@ -715,3 +729,246 @@ all_dists |> select(species, model_name, abs_dist) |>
 
 
 ```
+
+
+
+
+
+```{r}
+d_change_gr
+
+library(brms)
+library(cmdstanr)
+set_cmdstan_path("//wsl$/ECCC-WSL-UBUNTU-24/home/dhope/.cmdstan/cmdstan-2.40.0")
+priors <- c(prior(normal(0,50), class = Intercept),
+            prior(cauchy(0,50), class = sd))
+
+d_mod <- d_change_gr |> 
+  filter(region_type =='province' & model_name == "PC_ARU_CL_SS")
+
+m.brm <- brms::brm(pct_change_mean|se(pct_change_se) ~ 1 +(1|group),
+             data =d_mod,
+             prior = priors,cores = 4,
+             iter = 4000, backend = 'cmdstanr')
+  m.brm
+```
+$$ \begin{eqnarray} \text{d}_i & \sim & \text{Normal}(\theta_i, \sigma_i = \text{se}_i) \\ \theta_i & \sim & \text{Normal} (\mu, \tau) \\ \mu & \sim & \text{Normal} (0, 1) \\ \tau & \sim & \text{HalfCauchy} (0, 1) \end{eqnarray} $$
+
+```{r}
+library(tidybayes)
+
+m.brm %>%
+  spread_draws(b_Intercept, r_group[group,]) %>%
+  # add the grand mean to the group-specific deviations
+  mutate(mu =  r_group +b_Intercept) %>%
+  ungroup() %>%
+  mutate(group = str_replace_all(group, "[.]", " ")) %>% 
+
+  # plot
+  ggplot(aes(x = mu, y = reorder(group, mu))) +
+  geom_vline(xintercept =0, color = "grey", size = 1, linetype=2) +
+  geom_vline(xintercept = fixef(m.brm)[1, 1], color = "black", size = 1) +
+  geom_vline(xintercept = fixef(m.brm)[1, 3:4], color = "black", linetype = 2) +
+  stat_halfeye(.width = .95, size = 2/3) +
+  labs(x = expression(italic("Provincial change from Atlas 2")),
+       y = NULL) +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0))
+```
+
+
+```{r}
+
+
+m_brm2 <- brms::brm(pct_change_mean|se(pct_change_se) ~ 1 +(1|group/english_common_name),
+             data =d_mod,
+             prior = priors,cores = 4,
+             iter = 4000, backend = 'cmdstanr')
+m.brm
+
+
+```
+
+
+
+```{r}
+
+m_brm2 %>%
+  spread_draws(b_Intercept, r_group[group,]) %>%
+  # add the grand mean to the group-specific deviations
+  mutate(mu =  b_Intercept +r_group) %>%
+  ungroup() %>%
+  mutate(group = str_replace_all(group, "[.]", " ")) %>% 
+
+  # plot
+  ggplot(aes(x = mu, y = reorder(group, mu))) +
+  geom_vline(xintercept =0, color = "grey", size = 1, linetype=2) +
+  geom_vline(xintercept = fixef(m_brm2)[1, 1], color = "black", size = 1) +
+  geom_vline(xintercept = fixef(m_brm2)[1, 3:4], color = "black", linetype = 2) +
+  stat_halfeye(.width = .95, size = 2/3) +
+  labs(x = expression(italic("Provincial change from Atlas 2")),
+       y = NULL) +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0))
+
+
+```
+
+
+
+```{r}
+
+gen_mod_forest <- function(gr){
+  d_mod[d_mod$group==gr,] |> 
+  ggplot(aes(x = pct_change_median, y = reorder(english_common_name, pct_change_median))) +
+  geom_vline(xintercept =0, color = "grey", size = 1, linetype=2) +
+  # geom_vline(xintercept = fixef(m.brm)[1, 1], color = "black", size = 1) +
+  # geom_vline(xintercept = fixef(m.brm)[1, 3:4], color = "black", linetype = 2) +
+  geom_pointrange(aes(xmin = pct_change_qlow, xmax = pct_change_qhigh)) +
+  labs(x = expression(italic("Provincial % change from Atlas 2")),
+       y = NULL, title = gr) +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0))
+}
+
+gr_plots <- map(unique(d_mod$group), gen_mod_forest)
+names(gr_plots) <- unique(d_mod$group)
+
+gr_plots$SAR
+gr_plots$`Urban Birds`
+
+cairo_pdf("Change_Chapter/Sandbox/Species_groupings_PC_ARU_CL_SS.pdf", width = 12, height = 12)
+gr_plots
+dev.off()
+
+
+```
+
+```{r}
+
+
+
+as_draws_df(m_brm2) %>% 
+  select(starts_with("sd")) %>% 
+  gather(key, tau) %>% 
+  mutate(key = str_remove(key, "sd_") %>% str_remove(., "__Intercept")) %>% 
+  
+  ggplot(aes(x = tau, fill = key)) +
+  geom_density(color = "transparent", alpha = 2/3) +
+  scale_fill_viridis_d(NULL, end = .85) +
+  scale_y_continuous(NULL, breaks = NULL) +
+  xlab(expression(tau)) +
+  theme(panel.grid = element_blank())
+```
+
+```{r}
+priors_region <- c(prior(normal(0,50), class = Intercept),
+            prior(cauchy(0,50), class = sd))
+d_mod_region <- d_change_gr |> 
+  filter(region_type !='province' & model_name == "PC_ARU_CL_SS")
+
+m_brm_region <- brms::brm(pct_change_mean|se(pct_change_se) ~ 
+                            1 +(1|group) + (1| Region_Name),
+             data =d_mod_region,
+             prior = priors_region,cores = 4,
+             iter = 1000, backend = 'cmdstanr')
+
+
+
+
+```
+
+
+
+
+```{r}
+
+
+region_spread <- 
+m_brm_region %>%
+  spread_draws(b_Intercept, r_group[group,], `r_Region_Name`[region,]) %>%
+  # add the grand mean to the group-specific deviations
+  mutate(mu =  b_Intercept +r_group + r_Region_Name
+        ) %>%
+  ungroup() %>%
+  mutate(across(c(group, region),
+                ~str_replace_all(.x, "[.]", " "))) #|> 
+  # separate(group_region, into = c("group2", "region"), sep="_") |>
+  # filter(group==group2)
+
+  # plot
+region_spread |> #[sample(1:8e6,size = 1000, replace=F),] |> 
+  
+  ggplot(aes(x = mu, y = reorder(group, mu), fill = region)) +
+  geom_vline(xintercept =0, color = "grey", size = 1, linetype=2) +
+  stat_halfeye(.width = .95, size = 2/3, alpha =0.3) +
+  labs(x = expression(italic("Provincial change from Atlas 2")),
+       y = NULL) +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0))
+
+```
+
+
+
+
+
+```{r}
+
+    
+gen_plt <- function(mod, reg=T){
+
+  dat <- d_change_gr |>
+  mutate(pct_change_se=(pct_change_qhigh-pct_change_mean)/qnorm(ci_level)) |> 
+  select(model_name, sp_english,Region_Name,fc_region, group, starts_with('pct')) |> 
+  filter(!is.na(pct_change_mean)) %>% {
+    if(isFALSE(reg)){
+      filter(.,Region_Name=="Province-wide" & model_name==mod)
+    } else{
+        filter(.,Region_Name!="Province-wide" & model_name==mod)
+      }
+    } |>  
+    filter(group!="None") |> 
+  summarize(
+    n = n(),
+    mu = mean(pct_change_mean),
+    v_w = (sum(pct_change_se**2)/n),
+    v_b = sum((pct_change_mean-mu)**2)/(n-1),
+    v_total = v_w + v_b + v_b/n,
+    se_pooled = sqrt(v_total),
+    ci_size = se_pooled * qnorm(0.975),
+    .by = c(model_name,group,Region_Name)
+  ) 
+  
+  plt_ <- dat |> 
+  ggplot(aes(x = mu, y = group, colour = Region_Name)) +
+  geom_vline(xintercept =0, color = "grey", linewidth = 1, linetype=2) +
+  geom_pointrange(aes(xmin = mu-ci_size, xmax = mu+ci_size), 
+                  position = position_dodge(width = 0.8, orientation = 'y')) +
+  labs(x = expression(italic("Provincial % change from Atlas 2")),
+       y = NULL) +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0)) +
+  facet_grid(~model_name, scales = 'free')
+  
+  list(plot = plt_, data = dat)
+}
+plot_comb_se <- 
+map(unique(d_change_gr$model_name), gen_plt)
+
+
+plot_comb_se[[1]]$plot
+
+gen_plt("PC_ARU_CL_SS", F)
+gen_plt("PC_ARU_CL_SS", T)$plot +
+  facet_grid(model_name~group, scales = 'free')
+
+
+
+```
+

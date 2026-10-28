@@ -19,125 +19,8 @@ editor_options:
 #| label: setup-dat
 #| include: false
 #| message: false
-library(tidyverse)
-library(sf)
-eccc_core <-
-  "c:/users/hoped/OneDrive - EC-EC/Avian_Core_20251124.xlsx" |>
-  readxl::read_excel()
 
-atlas_groups <- read_csv("Data/species groupings.csv") |> 
-  pivot_longer(cols = -c(1:3), names_to = "Group", values_to = "ingroup") |> 
-  janitor::clean_names() |> 
-  filter(!is.na(ingroup)) |> 
-  mutate(species_name_model = str_to_lower(str_replace_all(english_common_name,
-                                                           "\\'|-|\\s", "_")))
-paired_sum <- read_rds(
-  "C:/Users/HopeD/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries.rds"
-) |>
-  transpose() |>
-  pluck("shared_change_summary") |>
-  list_rbind() |>
-  mutate(model_name = "Paired Sites - Point Counts", sp_english = sp_name)
-
-paired_sum_aru <-
-  read_rds(
-    "C:/Users/HopeD/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries_with_ARU.rds") |> 
-        # "C:/Users/HopeD/Documents/TMP_A3_SHINY_DEP/RAW_DATA/ATLAS_RAW_DATA/Ontario_BBA3_draft5/data_clean/model_output/paired_summaries/paired_summaries_with_ARU.rds"
-  # ) |>
-  transpose() |>
-  pluck("shared_change_summary") |>
-  list_rbind() |>
-  mutate(model_name = "Paired Sites - PC_ARU", sp_english = sp_name)
-
-
-paired <- bind_rows(paired_sum, paired_sum_aru) |>
-  mutate(
-    pct_change_median = pct_change_q50,
-    pct_change_qlow = pct_change_q10,
-    pct_change_qhigh = pct_change_q90,
-    ci_level = 0.9) 
-
-sg <- distinct(
-  # soc_groups[soc_groups$include...4 == 'Y', ],
-  atlas_groups,
-  english_common_name,
-  group, species_name_model
-) |>
-  mutate(
-    sp_english = case_when(
-      english_common_name == "Herring Gull" ~ "American Herring Gull",
-      english_common_name == "Warbling Vireo" ~ "Eastern Warbling Vireo",
-      english_common_name ==
-        "Golden-winged x Blue-winged Warbler" ~ "Golden-winged/Blue-winged Warbler",
-      english_common_name == "Whimbrel" ~ "Hudsonian Whimbrel",
-      english_common_name == "House Wren" ~ "Northern House Wren",
-      english_common_name == "Yellow Warbler" ~ "Northern Yellow Warbler",
-      str_detect(english_common_name, "Rock Pigeon") ~ "Rock Pigeon (Feral Pigeon)",
-      str_detect(english_common_name, "Redpoll") ~ "Redpoll",
-      TRUE ~ english_common_name
-    )
-  )
-
-d_change_models <-
-  list.files(
-    "C:/Users/HopeD/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/",
-    "regional_change_estimates\\w+.rds",
-    recursive = T,
-    full.names = T
-  ) |>
-  str_subset("_PC_ARU_CL_SS", negate = F) |>
-  map(read_rds) |>
-  list_rbind() |> 
-  # filter(model_name != "PC_ARU_CL") |> 
-     mutate(pct_change_se=(pct_change_qhigh-pct_change_mean)/qnorm(ci_level)) |> 
-  filter(sufficient_data)
-
-# mod_ss <- d_change_models[d_change_models$model_name=="PC_ARU_CL_SS",]
-# d_change_models <- 
-#   bind_rows(
-#     mod_ss,
-#     filter(d_change_models, model_name=="PC_ARU" & sp_english %notin% mod_ss$sp_english )
-#   )|> mutate(pct_change_se=(pct_change_qhigh-pct_change_mean)/qnorm(ci_level))
-
-
-
-d_change <-
-  d_change_models |>
-  bind_rows(
-    paired |>
-      left_join(
-        distinct(d_change_models, Region_Number, Region_Name),
-        by = join_by(BCR == Region_Number)
-      ) |>
-      select(any_of(names(d_change_models)))
-  ) |>
-  mutate(
-    fc_region = factor(
-      Region_Name,
-      levels = c(
-        "Province-wide",
-        "Lower Great Lakes / St. Lawrence Plain",
-        "Temperate Mixed",
-        "Boreal Shield West",
-        "Boreal Shield East",
-        "Hudson Plains"
-      )
-    ),
-    change_group = case_when(
-       (pct_change_qlow<0&pct_change_qhigh<0)~"Decline",
-       ( pct_change_qlow<0&pct_change_qhigh>0)~"Increase",
-        TRUE~"Uncertain or no change"
-    )
-  )
-
-d_change_gr <- d_change |>
-  left_join(
-    sg,
-    by = join_by(sp_english)
-  ) |>
-  replace_na(list(group = "None"))
-
-
+source("LoadDat.R")
 plot_spp <- function(df) {
   df |>
     ggplot(aes(sp_english, pct_change_median)) +
@@ -204,7 +87,7 @@ d_change_gr |>
 
 d_change_gr |>
   filter(Region_Name != "Province-wide"& group!="None" &
-           model_name =="PC_ARU_CL_SS" ) |>
+           model_name =="Spatial model" ) |>
   ggplot(aes(group, pct_change_median)) +
   geom_hline(yintercept = 0, linetype = 2) +
   # geom_line(aes(group = sp_english), alpha = 0.2)
@@ -268,7 +151,7 @@ d_change_gr |>
 #| fig-width: 10
 #| fig-height: 8
 dmm <-
-  d_change[d_change$Region_Name == "Province-wide", ] |>
+  d_change[d_change$Region_Name == "Province-wide" & d_change$model_name=="Spatial model", ] |>
   summarize(mean_mean = mean(pct_change_median, na.rm = T), .by = sp_english) |>
   mutate(spp_gr = forcats::fct_reorder(sp_english, mean_mean))
 
@@ -744,7 +627,7 @@ priors <- c(prior(normal(0,50), class = Intercept),
             prior(cauchy(0,50), class = sd))
 
 d_mod <- d_change_gr |> 
-  filter(region_type =='province' & model_name == "PC_ARU_CL_SS")
+  filter(region_type =='province' & model_name == "Spatial model")
 
 m.brm <- brms::brm(pct_change_mean|se(pct_change_se) ~ 1 +(1|group),
              data =d_mod,
@@ -820,21 +703,27 @@ m_brm2 %>%
 
 ```{r}
 
-gen_mod_forest <- function(gr){
-  d_mod[d_mod$group==gr,] |> 
-  ggplot(aes(x = pct_change_median, y = reorder(english_common_name, pct_change_median))) +
+gen_mod_forest <- function(df,gr, bcr=NULL){
+  if(is.null(bcr)){
+    d <- df[df$group==gr,] 
+    xlab_ <- expression(italic("Provincial % change from Atlas 2"))
+  } else{
+    d <- filter(df, group==gr & Region_Name == bcr)
+    xlab_ <- glue::glue("% change from Atlas 2 in {bcr}")
+  }
+  ggplot(d,aes(x = pct_change_median, y = reorder(english_common_name, pct_change_median))) +
   geom_vline(xintercept =0, color = "grey", size = 1, linetype=2) +
   # geom_vline(xintercept = fixef(m.brm)[1, 1], color = "black", size = 1) +
   # geom_vline(xintercept = fixef(m.brm)[1, 3:4], color = "black", linetype = 2) +
   geom_pointrange(aes(xmin = pct_change_qlow, xmax = pct_change_qhigh)) +
-  labs(x = expression(italic("Provincial % change from Atlas 2")),
-       y = NULL, title = gr) +
+  labs(x = xlab_,
+       y = NULL, title = paste0(c(gr, bcr), collapse = " - ")) +
   theme(panel.grid   = element_blank(),
         axis.ticks.y = element_blank(),
         axis.text.y  = element_text(hjust = 0))
 }
 
-gr_plots <- map(unique(d_mod$group), gen_mod_forest)
+gr_plots <- map(unique(d_mod$group), gen_mod_forest, df=d_mod)
 names(gr_plots) <- unique(d_mod$group)
 
 gr_plots$SAR
@@ -843,6 +732,24 @@ gr_plots$`Urban Birds`
 cairo_pdf("Change_Chapter/Sandbox/Species_groupings_PC_ARU_CL_SS.pdf", width = 12, height = 12)
 gr_plots
 dev.off()
+
+
+gr_plots_bcr <- 
+distinct(d_change_gr, group, fc_region, Region_Name) |> arrange(group, fc_region) |> 
+  pmap(function(group, Region_Name, ...){
+    gen_mod_forest(d_change_gr[d_change_gr$model_name=="Spatial model",], group, Region_Name) })
+
+cairo_pdf("Change_Chapter/Sandbox/Species_groupings_PC_ARU_CL_SS_bcr.pdf", width = 12, height = 12)
+gr_plots_bcr
+dev.off()
+
+
+d_change_gr |> filter(model_name=="Spatial model" &
+                         region_type=='province' &
+                        group %in% c("Forest Birds", "Short-Distance Migrants")) |> 
+  mutate(n=n(), .by=english_common_name) |> filter(n>1) |> 
+  gen_mod_forest(df = _, gr = "Forest Birds") + labs(title = "Forest Short-Distant Migrant Birds")
+ggsave("Change_Chapter/Sandbox/Forest_short_distance.png")
 
 
 ```
@@ -941,13 +848,20 @@ gen_plt <- function(mod, reg=T){
     v_total = v_w + v_b + v_b/n,
     se_pooled = sqrt(v_total),
     ci_size = se_pooled * qnorm(0.975),
-    .by = c(model_name,group,Region_Name)
-  ) 
+    Wald_pooled = mu**2/v_total,
+    lambda = (v_b + (v_b/n))/v_total,
+    r = lambda / (1-lambda),
+    df_old = (n-1) * (1+1/r)**2,
+    # df_obs = sum(n_hex_used),
+    t_df = dt(0.975, df_old),
+    ci_pooled_t = se_pooled *t_df,
+    .by = c(model_name,group,Region_Name,fc_region)
+  ) |> filter(n>1)
   
   plt_ <- dat |> 
   ggplot(aes(x = mu, y = group, colour = Region_Name)) +
   geom_vline(xintercept =0, color = "grey", linewidth = 1, linetype=2) +
-  geom_pointrange(aes(xmin = mu-ci_size, xmax = mu+ci_size), 
+  geom_pointrange(aes(xmin = mu-ci_pooled_t, xmax = mu+ci_pooled_t), 
                   position = position_dodge(width = 0.8, orientation = 'y')) +
   labs(x = expression(italic("Provincial % change from Atlas 2")),
        y = NULL) +
@@ -962,12 +876,124 @@ plot_comb_se <-
 map(unique(d_change_gr$model_name), gen_plt)
 
 
-plot_comb_se[[1]]$plot
+plot_comb_se[[2]]
 
 gen_plt("PC_ARU_CL_SS", F)
 gen_plt("PC_ARU_CL_SS", T)$plot +
   facet_grid(model_name~group, scales = 'free')
 
+gr_dat_sum <- 
+plot_comb_se |> transpose() |>
+  pluck("data") |> bind_rows() 
+  
+gr_bcr_plt <- 
+unique(gr_dat_sum$group) |> 
+  map(~{
+    filter(gr_dat_sum,group==.x & str_detect(model_name, "PC_ARU", negate=T)) |> 
+  ggplot(aes(mu,fc_region, 
+             colour =model_name, shape = model_name)) +
+   geom_vline(xintercept =0, color = "grey", linewidth = 1, linetype=2) +
+  geom_pointrange(aes(xmin = mu-ci_pooled_t, xmax = mu+ci_pooled_t), 
+                  position = position_dodge(width = 0.4, orientation = 'y'))  +
+      geom_text(data = filter(gr_dat_sum,group==.x & str_detect(model_name, "Spatial model")),
+                colour = 'grey',
+        aes(label=n),  x = Inf, hjust = "inward", size = 5) +
+   facet_grid(~group, scales = 'free') +labs(x = expression(italic("Provincial % change from Atlas 2")),
+       y = NULL, colour = NULL, shape = NULL)  +
+      rcartocolor::scale_colour_carto_d() +
+      theme(legend.position = 'bottom')
+  })
+
+cairo_pdf("Species_groupings_by_bcr.pdf", width = 8, height = 6)
+gr_bcr_plt
+dev.off()
+
+```
+
+```{r}
+
+
+gr_bcr_plt_raw <- 
+unique(gr_dat_sum$group) |> 
+  map(~{
+    filter(d_change_gr,group==.x & str_detect(model_name, "PC_ARU", negate=T) & Region_Name!="Province-wide") |> 
+  ggplot(aes(pct_change_median,fc_region, 
+             colour =model_name, shape = model_name)) +
+   geom_vline(xintercept =0, color = "grey", linewidth = 1, linetype=2) +
+  geom_pointrange(aes(xmin = pct_change_qlow, xmax = pct_change_qhigh), 
+                  position = position_jitter(width = 0, height = 0.2))  +
+      # geom_text(data = filter(gr_dat_sum,group==.x & str_detect(model_name, "Spatial model")),
+      #           colour = 'grey',
+      #   aes(label=n),  x = Inf, hjust = "inward", size = 5) +
+   facet_grid(~model_name, scales = 'free') +labs(x = expression(italic("Provincial % change from Atlas 2")),
+       y = NULL, colour = NULL, shape = NULL, title = .x)  +
+      rcartocolor::scale_colour_carto_d() +
+      theme(legend.position = 'bottom')
+  })
+
+cairo_pdf("Species_groupings_by_bcr_raw.pdf", width = 12, height = 10)
+gr_bcr_plt_raw
+dev.off()
+
+
+```
+
+```{r}
+d_split <- 
+d_change |> 
+  filter(Region_Name=="Province-wide") |> 
+  arrange(pct_change_median) |> 
+  mutate(order = row_number(),
+         english_common_name= sp_english,
+         group = ntile(order, n = 10) )#|> 
+  # nest(.by =group)
+  
+d_sp_plt <- map(1:max(d_split$group), ~{d_split[d_split$group==.x,] |> gen_mod_forest(gr = .x)} )
+
+
+cairo_pdf("Change_Chapter/Sandbox/Ranked_Provincial_Change.pdf", width = 12, height = 10)
+d_sp_plt
+dev.off()
+
+```
+
+
+
+
+```{r}
+d_bcr_sort <- 
+d_change |> filter(model_name=="Spatial model"&region_type!='province') |> 
+  left_join(distinct(d_split, sp_english, group, order, pct_change_median) |> 
+              rename(prov_pct_change_median=pct_change_median),
+            by = join_by(sp_english)) |> 
+  arrange(group, fc_region) |> 
+  mutate(english_common_name=sp_english)
+
+d_bcr_plt <- 
+pmap(distinct(d_bcr_sort, fc_region, group),
+     function(group, fc_region, ...){
+    gen_mod_forest(d_bcr_sort, group, fc_region) })
+
+plot_bcr_ranked <- map(1:max(d_bcr_sort$group), ~{d_bcr_sort[d_bcr_sort$group==.x,] |> 
+ggplot(aes(x = pct_change_median, y = reorder(english_common_name,
+                                              prov_pct_change_median))) +
+  geom_vline(xintercept =0, color = "grey", size = 1, linetype=2) +
+  # geom_vline(xintercept = fixef(m.brm)[1, 1], color = "black", size = 1) +
+  # geom_vline(xintercept = fixef(m.brm)[1, 3:4], color = "black", linetype = 2) +
+  geom_pointrange(aes(xmin = pct_change_qlow, xmax = pct_change_qhigh,
+                      colour = fc_region),
+                   position = position_dodge(width = 0.8, orientation = 'y')) +
+  labs(x = "",
+       y = NULL, title = NULL) +
+  theme(panel.grid   = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.text.y  = element_text(hjust = 0)) +
+  rcartocolor::scale_colour_carto_d() +
+  theme_minimal()})
+
+cairo_pdf("Change_Chapter/Sandbox/Ranked_Provincial_ChangeBCR.pdf", width = 12, height = 10)
+plot_bcr_ranked
+dev.off()
 
 
 ```

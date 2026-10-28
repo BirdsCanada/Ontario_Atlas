@@ -346,7 +346,7 @@ gen_dist <- function(spp_code, model_name) {
   # browser()
   f_ <- list.files(
     glue::glue(
-      "../RAW_DATA/ATLAS_RAW_DATA/Ontario_A3_Rasters_counts_figs/rasters_{model_name}/"
+      "C:/Users/HOped/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/rasters_{model_name}/"
     ),
     glue::glue("^{spp_code}_a\\d.tif"),
     full.names = T
@@ -396,7 +396,7 @@ all_mods <-
     ~ {
       rast_og <- list.files(
         glue::glue(
-          "../RAW_DATA/ATLAS_RAW_DATA/Ontario_A3_Rasters_counts_figs/rasters_{.x}/"
+          "C:/Users/HOped/OneDrive - EC-EC/Projects/Atlas-3/Ontario_BBA3_draft5/data_clean/model_output/rasters_{.x}/"
         ),
         "_a\\d.tif"
       )
@@ -412,23 +412,21 @@ all_mods <-
 # future::plan(future::multisession(workers = 12))
 # all_spp_res <- pmap(all_mods, gen_dist) |> futurize::futurize()
 # future::plan(future::sequential())
-# write_rds(all_spp_res, "../RAW_DATA/Raw_species_res_distance2.rds")
-all_spp_res <-read_rds( "..RAW_DATA/Raw_species_res_distance2.rds")
+# write_rds(all_spp_res, "../RAW_DATA/Raw_species_res_distance_final.rds")
+all_spp_res <-read_rds( "..RAW_DATA/Raw_species_res_distance_final.rds")
 
 # gen_dist("blue_winged_warbler", "PC_ARU")
 
 all_dists <- all_spp_res |> transpose() |> pluck("change") |> list_rbind() |> 
   mutate(abs_change =abs(units::drop_units(change_deg)),
   abs_dist =  abs(units::drop_units(change_dist_km))) |> 
-    left_join(d_change[d_change$Region_Number=='province',], by = join_by(model_name, species==sp_file)) |> 
+    left_join(d_change[d_change$Region_Number=='province',], by = join_by( species==sp_file)) |> 
     mutate(delta_x = sin(change_rad)* change_dist_km,
-    delta_y = cos(change_rad)* change_dist_km) |> 
-       filter( (model_name=="PC_ARU" & sp_english %notin% mod_ss$sp_english) |(model_name == "PC_ARU_CL_SS"))
+    delta_y = cos(change_rad)* change_dist_km) 
 all_centroids <- all_spp_res |>
   transpose() |>
   pluck("centroids") |>
-  list_rbind() |> 
-  filter( (model_name=="PC_ARU" & species %notin% mod_ss$sp_file) |(model_name == "PC_ARU_CL_SS"))
+  list_rbind() 
 ```
 
 
@@ -470,7 +468,7 @@ yend=units::drop_units(delta_y)), alpha =0.4) +
 #| fig-height: 8
 all_dists |> #slice_max(change_dist_km, n=5)
   # filter(str_detect(sp_english, "Swallow|Swift")) |> 
-  filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Aerial ")]) |> 
+  filter(sp_english %in% sg$sp_english[str_detect(sg$group, "Aerial ")]) |> 
 ggplot()+
   geom_segment(data = ,
 x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
@@ -487,14 +485,14 @@ yend=units::drop_units(delta_y)), alpha =0.4) +
 #| fig-height: 8
 dist_shore <- all_dists |> #slice_max(change_dist_km, n=5)
   # filter(str_detect(sp_english, "Swallow|Swift")) |> 
-  filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Shorebirds")])  
+  filter(sp_english %in% sg$sp_english[str_detect(sg$group, "Shorebirds")])  
 ggplot()+
   geom_segment(data =dist_shore,
 x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
 yend=units::drop_units(delta_y)), alpha =0.4) +
   # facet_wrap(model_name~ change_group) +
   ggrepel::geom_text_repel(
-    data = dist_shore[dist_shore$abs_dist>100,],
+    data = dist_shore[dist_shore$abs_dist>50,],
     aes(x = units::drop_units(delta_x), 
     y = units::drop_units(delta_y), label = sp_english)) +
   labs(x = "Change in distribution (West to East; km)", 
@@ -508,7 +506,7 @@ yend=units::drop_units(delta_y)), alpha =0.4) +
 #| fig-height: 8
 dist_grass <- all_dists |> #slice_max(change_dist_km, n=5)
   # filter(str_detect(sp_english, "Swallow|Swift")) |> 
-  filter(sp_english %in% sg$sp_english[str_detect(sg$Group, "Grassland")])  
+  filter(sp_english %in% sg$sp_english[str_detect(sg$group, "Grassland")])  
 ggplot()+
   geom_segment(data =dist_grass,
 x = 0, y = 0, aes(xend = units::drop_units(delta_x), 
@@ -997,4 +995,80 @@ dev.off()
 
 
 ```
+
+
+
+
+
+```{r}
+
+
+d_change |> 
+  filter(model_name=="Spatial model" & 
+           str_detect(sp_english, "wallow|wift")) |> 
+  ggplot(aes(pct_change_median,
+             sp_english, colour = fc_region,
+             shape = fc_region=="Province-wide"
+              )) +
+  geom_vline(linetype = 2, linewidth = 1, xintercept =2, colour = 'grey') +
+  # geom_point(aes(size = mu3_median)) +
+  geom_pointrange(aes(xmin = pct_change_qlow, xmax = pct_change_qhigh),
+                      position = position_dodge(width = 0.4, orientation = 'y'))  +
+  # facet_wrap(~sp_english,ncol=1) +
+  labs(x =expression(italic("% change in abundance from Atlas 2")),
+       y=NULL, colour = "BCR") +
+  scale_size_area(max_size = 4) +
+  scale_shape_manual(values = list("TRUE" =17, "FALSE" =19)) +
+  theme(legend.position = 'bottom') +
+  rcartocolor::scale_colour_carto_d() +
+  scale_x_continuous(breaks = seq(-100, 500, by = 50)) +
+  guides(shape = 'none')
+ggsave("Change_Chapter/Sandbox/Swift_Swallow_Change_BCRs.png", width = 6, height = 10)
+
+
+```
+
+
+
+
+```{r}
+d_change |> 
+  filter(model_name=="Spatial model" & 
+           str_detect(sp_english, "Owl")) |> 
+  ggplot(aes(pct_change_median,
+             sp_english, colour = fc_region,
+             shape = fc_region=="Province-wide"
+              )) +
+  geom_vline(linetype = 2, linewidth = 1, xintercept =2, colour = 'grey') +
+  # geom_point(aes(size = mu3_median)) +
+  geom_pointrange(aes(xmin = pct_change_qlow, xmax = pct_change_qhigh),
+                      position = position_dodge(width = 0.4, orientation = 'y'))  +
+  # facet_wrap(~sp_english,ncol=1) +
+  labs(x =expression(italic("% change in abundance from Atlas 2")),
+       y=NULL, colour = "BCR") +
+  scale_size_area(max_size = 4) +
+  scale_shape_manual(values = list("TRUE" =17, "FALSE" =19)) +
+  theme(legend.position = 'bottom') +
+  rcartocolor::scale_colour_carto_d() +
+  scale_x_continuous(breaks = seq(-100, 500, by = 50)) +
+  guides(shape = 'none')
+ggsave("Change_Chapter/Sandbox/Owl_Change_BCRs.png", width = 6, height = 10)
+
+
+```
+
+```{r}
+
+
+d_change |> 
+  filter(model_name=="Spatial model") |> 
+  jt(fc_region,change_group ) |> 
+  gt::gt() |> 
+  gt::cols_label(
+    fc_region = ""
+  ) |> gt::gtsave("Change_Chapter/Sandbox/Species_change_summaries.png")
+
+
+```
+
 

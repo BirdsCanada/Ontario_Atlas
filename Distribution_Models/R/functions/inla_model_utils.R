@@ -11,23 +11,26 @@
 #   2. Per-species datasets   sp_data_path, make_sp_dat_record, load_sp_dat,
 #                             filter_survey_rows, select_mode_rows,
 #                             assess_modelability,
-#                             select_modelable_species (07b), choose_error_family (07b)
+#                             select_modelable_species (07c), choose_error_family (07c)
 #   3. Model fitting          make_TOD_mesh, TOD_curve_from_fit,
 #                             optimal_TOD_from_fit, make_DOY_mesh,
 #                             DOY_curve_from_fit, fit_PC_ARU, fit_PC_ARU_CL
 #   4. Prediction             make_pred_formula_multiatlas, make_pred_grid,
-#                             predict_inla, predict_all_pixels
+#                             predict_inla, predict_all_pixels,
+#                             choose_prediction_survey
 #   5. Variance correction    get_var, has_hyper, sample_hyper_vars,
 #                             make_lognormal_correction,
 #                             apply_lognormal_correction,
-#                             describe_lognormal_correction
+#                             describe_lognormal_correction,
+#                             gauss_hermite_rule, marginalize_cloglog_iid (PA)
 #   6. Posterior summaries    summarize_posterior, summarize_predictions,
 #                             make_hex_draws
 #   7. Shared-footprint       make_shared_footprint_dataset,
 #      (paired) analysis      fit_inla_shared_footprint_change,
 #                             summarize_shared_footprint_change
 #
-# Sourced by 06 (sections 1-2 only), 07, 07b and 09 (get_var() only).
+# Sourced by 06 (sections 1-2 only), 07a, 07b, 07c and 09
+# (get_var() only).
 # ============================================================
 
 suppressPackageStartupMessages({
@@ -103,7 +106,7 @@ make_cov_df <- function(covars, mean = 0, sd_linear = 1) {
 # min_special_squares is either a single number (applied to every type) or a
 # named vector: named types use their value; unlisted types fall back to a
 # "default" entry if present, else the first entry. Called only through
-# select_mode_rows(), which 06, 07 and fit_PC_ARU_CL() all use, so the
+# select_mode_rows(), which 06, 07a/07b and fit_PC_ARU_CL() all use, so the
 # keep/drop decision cannot drift between them.
 resolve_special_threshold <- function(type, min_special_squares) {
   v <- min_special_squares
@@ -185,7 +188,7 @@ calibrate_pc_lambda <- function(target_prob,
 # ============================================================
 # 2. Per-species analysis datasets
 #
-# Script 06 writes one lightweight record per species; scripts 07 and 07b read
+# Script 06 writes one lightweight record per species; scripts 07a-07c read
 # them back with load_sp_dat() and rehydrate a full sf `sp_dat`.
 #
 # WHAT IS STORED
@@ -203,11 +206,11 @@ calibrate_pc_lambda <- function(target_prob,
 #     error family, the fit itself) sees the same zeroed data.
 #   Survey types are NOT filtered: every record holds point counts, ARUs,
 #   checklists and special surveys. Downstream scripts narrow this:
-#     07   -> mode$survey_types / mode$survey_durations (R/00_model_modes.R)
-#     07b  -> survey_types = "Point_Count"
+#     07a/07b -> mode$survey_types / mode$survey_durations (R/00_model_modes.R)
+#     07c     -> survey_types = "Point_Count"
 # ============================================================
 
-# Path to one species' record. Kept in one place so 06/07/07b cannot disagree.
+# Path to one species' record. Kept in one place so 06/07a/07b/07c cannot disagree.
 sp_data_path <- function(dir, sp_english) {
   file.path(dir, paste0(sp_filename(sp_english), "_sp_dat.rds"))
 }
@@ -227,7 +230,7 @@ sp_data_path <- function(dir, sp_english) {
 # sp_safe_dates_unmodified
 #                ORIGINAL safe-date definitions: same rows, but start_doy/end_doy
 #                are NA in regions where the species has no safe dates. Stored
-#                verbatim and NOT used for filtering here; script 07 ships it into
+#                verbatim and NOT used for filtering here; 07a/07b ship it into
 #                each prediction file and scripts 08 and 09 use it to zero
 #                predictions in the no-safe-date regions. Keeping both objects on the record is
 #                what lets "fit everywhere, predict only where safe" stay coherent.
@@ -248,7 +251,7 @@ make_sp_dat_record <- function(surveys_f,
   if (nrow(sp_safe_dates) == 0) return(NULL)
   
   # Prediction reference day: midpoint of the window shared by all regions the
-  # species occupies. Computed once here so 07 and 07b cannot diverge. na.rm is
+  # species occupies. Computed once here so 07a-07c cannot diverge. na.rm is
   # defensive; sp_safe_dates windows are filled (non-NA) by the time we get here.
   pred_doy <- (min(sp_safe_dates$end_doy,   na.rm = TRUE) +
                max(sp_safe_dates$start_doy, na.rm = TRUE)) / 2
@@ -289,7 +292,7 @@ make_sp_dat_record <- function(surveys_f,
     n_surveys                = nrow(sp_dat),
     n_detections             = sum(sp_dat$count > 0),     # after zeroing
     n_nonsafe_zeroed         = sum(zero_idx),             # detections set to 0
-    nonsafe_zeroed           = TRUE,                      # record-format flag checked by 06/07
+    nonsafe_zeroed           = TRUE,                      # record-format flag checked by 06/07a/07b
     date_created             = Sys.time()
   )
 }
@@ -348,7 +351,7 @@ load_sp_dat <- function(path, all_surveys, survey_types = NULL,survey_durations 
 
 # Keep the survey types and PC/ARU durations a model mode uses.
 #
-# Single definition of a mode's row set, used by load_sp_dat() (07) and by the
+# Single definition of a mode's row set, used by load_sp_dat() (07a/07b) and by the
 # modelability table in 06. The duration filter applies ONLY to structured
 # surveys (point counts + ARUs): checklists and special surveys have variable
 # duration by design and are never dropped by it.
@@ -377,7 +380,7 @@ filter_survey_rows <- function(sp_dat, survey_types = NULL, survey_durations = N
 # fit_PC_ARU_CL() keeps a special type's intercept only where the species is
 # detected in >= its square threshold (pooled across atlases), and DROPS every
 # row of a type below it. This applies the same rule, on the same resolver, so
-# modelability (06 and 07), the saved data record and the fit all see one row
+# modelability (06, 07a and 07b), the saved data record and the fit all see one row
 # set. Inert when special_survey_types is empty.
 #
 # Returns a list:
@@ -387,7 +390,7 @@ filter_survey_rows <- function(sp_dat, survey_types = NULL, survey_durations = N
 #   special_report  per type: n_det_squares / threshold / kept
 #   special_ok      TRUE if the mode has no special surveys, or >= 1 type kept.
 #                   FALSE means the SS fit carries no special terms and is
-#                   identical to the non-SS mode (skipped in 07 only when
+#                   identical to the non-SS mode (skipped in 07a/07b only when
 #                   SS_SKIP_IF_NO_SPECIAL = TRUE).
 select_mode_rows <- function(sp_dat,
                              special_survey_types = character(0),
@@ -437,7 +440,7 @@ select_mode_rows <- function(sp_dat,
 # Returns a list:
 #   by_atlas            one row per atlas present in sp_dat: survey and square
 #                       coverage, detections (total and by survey family), and
-#                       whether that atlas qualifies. Saved by 07 as
+#                       whether that atlas qualifies. Saved by 07a/07b as
 #                       sp_det_summary.
 #   is_modelable        any atlas qualifies
 #   qualifying_atlases  atlases that qualify
@@ -482,7 +485,7 @@ assess_modelability <- function(sp_dat, min_squares = 20) {
 
 # Species that have enough data to support a model fit.
 #
-# Used by 07b only (07 gates with assess_modelability()). A species qualifies
+# Used by 07c only (07a/07b gate with assess_modelability()). A species qualifies
 # if, in at least one Atlas x Survey_Type stratum of point counts / ARUs in
 # species_detection_summaries, it has >= min_detections detections AND
 # > min_squares detected squares.
@@ -509,7 +512,7 @@ select_modelable_species <- function(species_detection_summaries,
 }
 
 
-# Choose poisson vs nbinomial from the observed counts (used by 07b; 07 uses
+# Choose poisson vs nbinomial from the observed counts (used by 07c; 07a uses
 # its own choose_stream_family()).
 #
 # No counts are trimmed. Negative binomial is used when the top 1% of nonzero
@@ -627,7 +630,7 @@ make_TOD_mesh <- function(span         = c(0, 24),
 # failure; the caller should fall back to the empirical estimate.
 #
 # mod           Fitted inlabru model.
-# hours_allowed Numeric vector of admissible hours (see coverage table in 07).
+# hours_allowed Numeric vector of admissible hours (see coverage table in 07a/07b).
 # by            Grid resolution for the search, in hours.
 # ==============================================================================
 
@@ -797,7 +800,7 @@ fit_PC_ARU <- function(
     # min_site_surveys: minimum RETAINED surveys for a site to get a level.
     # min_site_levels:  minimum number of such sites, else the term is dropped
     #   (sigma_site cannot be identified from a handful of sites).
-    prior_site_pcprec = c(1, 0.5),    # P(sigma_site > 1) = 0.5  (default; script 07 overrides with c(1, 0.1))
+    prior_site_pcprec = c(1, 0.5),    # P(sigma_site > 1) = 0.5  (default; 07a/07b override with c(1, 0.1))
     
     # include_site: master switch for the site-level iid random effect.
     #   TRUE  -> keep the data-driven gate below (the term is used only
@@ -809,14 +812,16 @@ fit_PC_ARU <- function(
     min_site_surveys  = 2,
     min_site_levels   = 10,
     
-    # Likelihood
-    family = c("poisson", "nbinomial"),
-    
+    # Likelihood. "binomial" = presence/absence (count must be 0/1), fitted as
+    # Bernoulli with a cloglog link, so the linear predictor stays log(lambda)
+    # and every log-scale component and prior keeps its count-model meaning.
+    family = c("poisson", "nbinomial", "binomial"),
+
     # Negative-binomial PC prior settings
     nb_pc_target_prob     = 0.5,
     nb_pc_threshold_theta = 5,
     nb_pc_seed            = 1L,   # seed for the Monte Carlo lambda calibration
-    
+
     # inlabru / INLA options
     inla_mode    = "experimental",
     int_strategy = "ccd",
@@ -826,17 +831,21 @@ fit_PC_ARU <- function(
     cpo          = FALSE,
     retry        = 0
 ) {
-  
+
   # ------------------------------------------------------------
   # 1. Validate inputs
   # ------------------------------------------------------------
-  
+
   family <- match.arg(family)
-  
+
   if (!inherits(sp_dat, "sf")) {
     stop("sp_dat must be an sf object with a geometry column.")
   }
-  
+
+  if (family == "binomial" && !all(sp_dat$count %in% c(0, 1))) {
+    stop("family = 'binomial' needs a 0/1 response; convert count first.")
+  }
+
   required_cols <- c(
     "count",
     "Atlas3",
@@ -1219,23 +1228,34 @@ fit_PC_ARU <- function(
   # ------------------------------------------------------------
   
   lambda <- NA_real_   # NB PC-prior rate; set below when family = "nbinomial"
-  
+
   if (family == "poisson") {
-    
+
     lik <- inlabru::like(
       family  = "poisson",
       formula = model_formula,
       data    = sp_dat
     )
-    
+
+  } else if (family == "binomial") {
+
+    # Bernoulli (Ntrials = 1) with cloglog link: P(y = 1) = 1 - exp(-lambda).
+    lik <- inlabru::like(
+      family         = "binomial",
+      formula        = model_formula,
+      data           = sp_dat,
+      Ntrials        = 1,
+      control.family = list(control.link = list(model = "cloglog"))
+    )
+
   } else {
-    
+
     lambda <- calibrate_pc_lambda(
       target_prob     = nb_pc_target_prob,
       threshold_theta = nb_pc_threshold_theta,
       seed            = nb_pc_seed
     )
-    
+
     lik <- inlabru::like(
       family  = "nbinomial",
       formula = model_formula,
@@ -1250,39 +1270,39 @@ fit_PC_ARU <- function(
       )
     )
   }
-  
+
   # ------------------------------------------------------------
   # 13. Set inlabru / INLA options
   # ------------------------------------------------------------
-  
+
   bru_opts <- list(
     inla.mode = inla_mode,
-    
+
     control.inla = list(
       int.strategy = int_strategy,
       strategy     = strategy
     ),
-    
+
     control.compute = list(
       waic = waic,
       cpo  = cpo
     ),
-    
+
     bru_verbose = bru_verbose
   )
-  
+
   # ------------------------------------------------------------
   # 14. Fit model, with optional retries
   # ------------------------------------------------------------
-  
+
   attempt <- 0
   last_err <- NULL
   fit <- NULL
-  
+
   while (attempt <= retry) {
-    
+
     attempt <- attempt + 1
-    
+
     fit <- try(
       inlabru::bru(
         components = model_components,
@@ -1291,23 +1311,26 @@ fit_PC_ARU <- function(
       ),
       silent = TRUE
     )
-    
+
     if (!inherits(fit, "try-error")) {
       break
     }
-    
+
     last_err <- fit
     fit <- NULL
   }
-  
+
   if (is.null(fit)) {
     stop(
       "bru() failed after ", attempt, " attempt(s).\nLast error:\n",
       as.character(last_err)
     )
   }
-  
-  # Record what the site and square terms actually did, for model_summaries.
+
+  # Record the observation model, and what the site and square terms actually
+  # did, for model_summaries.
+  fit$family          <- family
+  fit$link            <- if (family == "binomial") "cloglog" else "log"
   fit$use_site_re     <- use_site_re
   fit$use_square_re   <- use_square_re
   fit$n_site_levels   <- if (use_site_re) n_site else 0L
@@ -1433,8 +1456,10 @@ fit_PC_ARU_CL <- function(
     # every survey type (PC + ARU + BBA + LT), and when nbinomial ONE size -- a
     # single observation model, far easier to identify than a per-stream split.
     # Only the effort terms differ by stream; the family and the site-level
-    # random effect are shared (3b).
-    family = c("nbinomial", "poisson"),
+    # random effect are shared (3b). "binomial" = presence/absence (count must
+    # be 0/1): Bernoulli with a cloglog link, so the linear predictor stays
+    # log(lambda) and the effort, protocol and change terms keep their meaning.
+    family = c("nbinomial", "poisson", "binomial"),
     
     # Negative-binomial PC prior settings (shared across all surveys).
     nb_pc_target_prob     = 0.5,
@@ -1460,7 +1485,11 @@ fit_PC_ARU_CL <- function(
   if (!inherits(sp_dat, "sf")) {
     stop("sp_dat must be an sf object with a geometry column.")
   }
-  
+
+  if (family == "binomial" && !all(sp_dat$count %in% c(0, 1))) {
+    stop("family = 'binomial' needs a 0/1 response; convert count first.")
+  }
+
   required_cols <- c(
     "count",
     "Atlas3",
@@ -1566,7 +1595,7 @@ fit_PC_ARU_CL <- function(
   # ALL their rows dropped here, so they neither get an intercept nor contaminate
   # the reference protocol. Row-dropping happens BEFORE the masks, the site index
   # and the effort medians below, all of which must see the final row set.
-  # Same rule and resolver as 06/07 (select_mode_rows()).
+  # Same rule and resolver as 06/07a/07b (select_mode_rows()).
   sel <- select_mode_rows(
     sp_dat               = sp_dat,
     special_survey_types = special_survey_types,
@@ -1611,7 +1640,7 @@ fit_PC_ARU_CL <- function(
   # ----------------------------------------------------------------------------
   # 3b. Site index -- ONE term, SHARED by every survey type
   # ----------------------------------------------------------------------------
-  # Keyed on site_id (atlas-specific 500-m site grid from add_site_ids() in 07) across ALL rows, so
+  # Keyed on site_id (atlas-specific 500-m site grid from add_site_ids() in 07a/07b) across ALL rows, so
   # linear transects load onto the SAME site nodes as PC/ARU/BBA: repeat visits
   # to a place are repeat visits whatever the protocol, and one shared variance
   # is far better identified than two. The error family is shared across streams
@@ -1792,6 +1821,17 @@ fit_PC_ARU_CL <- function(
 
   tod_off_types <- special_keep[!share_tod_type]
   doy_off_types <- special_keep[!share_doy_type]
+
+  # Typical survey hour of each kept special type (median), taken BEFORE the
+  # TOD pin below. Recorded on the fit so that choose_prediction_survey() can
+  # predict on a TOD-sharing special protocol at that protocol's own hour.
+  special_ref_TOD <- stats::setNames(rep(NA_real_, length(special_keep)),
+                                     special_keep)
+  for (type in special_keep) {
+    special_ref_TOD[[type]] <- stats::median(
+      sp_dat$Hours_After_Reference[sp_dat$Survey_Type == type], na.rm = TRUE
+    )
+  }
 
   # A row is gated out of a smooth iff its (special) type opted out; all PC/ARU/
   # BBA/LT rows keep weight 1.
@@ -2171,23 +2211,34 @@ fit_PC_ARU_CL <- function(
   # family and, when nbinomial, a single size. Mirrors fit_PC_ARU().
   
   lambda <- NA_real_   # NB PC-prior rate; set below when family = "nbinomial"
-  
+
   if (family == "poisson") {
-    
+
     lik <- inlabru::like(
       family  = "poisson",
       formula = model_formula,
       data    = sp_dat
     )
-    
+
+  } else if (family == "binomial") {
+
+    # Bernoulli (Ntrials = 1) with cloglog link: P(y = 1) = 1 - exp(-lambda).
+    lik <- inlabru::like(
+      family         = "binomial",
+      formula        = model_formula,
+      data           = sp_dat,
+      Ntrials        = 1,
+      control.family = list(control.link = list(model = "cloglog"))
+    )
+
   } else {
-    
+
     lambda <- calibrate_pc_lambda(
       target_prob     = nb_pc_target_prob,
       threshold_theta = nb_pc_threshold_theta,
       seed            = nb_pc_seed
     )
-    
+
     lik <- inlabru::like(
       family         = "nbinomial",
       formula        = model_formula,
@@ -2287,6 +2338,7 @@ fit_PC_ARU_CL <- function(
   # One shared family/size across all survey types; record it and the per-stream
   # observation counts (data composition, not a family split).
   fit$family            <- family
+  fit$link              <- if (family == "binomial") "cloglog" else "log"
   fit$n_stationary_obs  <- n_pc_aru + n_bba
   fit$n_pc_aru_obs      <- n_pc_aru
   fit$n_bba_obs         <- n_bba
@@ -2296,6 +2348,8 @@ fit_PC_ARU_CL <- function(
   # per-type detection-square audit (n_det_squares / threshold / kept), whether
   # they shared the TOD/DOY smooths, and how many rows they contributed.
   fit$special_survey_types       <- special_keep
+  fit$special_slug               <- special_slug      # type -> effect_<slug> name
+  fit$special_ref_TOD            <- special_ref_TOD   # median survey hour per type
   fit$special_survey_report      <- special_report
   fit$special_share_tod          <- share_tod_type
   fit$special_share_doy          <- share_doy_type
@@ -2317,26 +2371,36 @@ fit_PC_ARU_CL <- function(
 #
 # cov_df Covariate table from make_cov_df() (the fitted covariate terms).
 # include_kappa Include atlas-square random effects in predictions.
-# Returns a formula suitable for inlabru::generate(). ARU / checklist / special
-# protocol terms are omitted, so predictions are on the 5-min point-count scale.
-make_pred_formula_multiatlas <- function(cov_df = NULL, include_kappa = FALSE) {
+# special_effect NULL (default) predicts on the 5-min point-count scale; a
+#   special-survey effect name (e.g. "effect_SS_northern_ontario_owl_survey",
+#   from choose_prediction_survey()) adds that protocol's intercept instead.
+# include_TOD, include_DOY Drop the TOD / DOY smooth when predicting on a special
+#   protocol that does not share it (its intercept already absorbs timing).
+# Returns a formula suitable for inlabru::generate(). ARU / checklist protocol
+# terms are always omitted.
+make_pred_formula_multiatlas <- function(cov_df         = NULL,
+                                         include_kappa  = FALSE,
+                                         special_effect = NULL,
+                                         include_TOD    = TRUE,
+                                         include_DOY    = TRUE) {
   cov_terms <- character(0)
-  
+
   if (!is.null(cov_df) && nrow(cov_df) > 0) {
     cov_terms <- cov_df %>%
       dplyr::mutate(term = paste0("Beta", beta, "_", covariate, "*I(", covariate, "^", beta, ")")) %>%
       dplyr::pull(term)
   }
-  
+
   base_terms <- c(
     "Intercept",
     "spde_mean",
     "Atlas3_c * spde_diff",
     "Atlas3_c * effect_Atlas3",
-    "DOY_global",
-    "TOD_global"
+    if (isTRUE(include_DOY)) "DOY_global",
+    if (isTRUE(include_TOD)) "TOD_global",
+    special_effect
   )
-  
+
   eta_expr <- paste(c(base_terms, cov_terms), collapse = " + ")
   
   if (include_kappa) {
@@ -2397,10 +2461,14 @@ predict_inla <- function(mod,
 }
 
 # Draws on the full OBBA2 + OBBA3 grid; returns list(eta, mu2, mu3), where mu2 /
-# mu3 are exp(eta) for the OBBA2 / OBBA3 rows (pixel x draw).
+# mu3 are the response-scale draws for the OBBA2 / OBBA3 rows (pixel x draw):
+#   link = "log"     -> exp(eta)              (expected count)
+#   link = "cloglog" -> 1 - exp(-exp(eta))    (probability of detection)
 predict_all_pixels <- function(mod, pred_grid, pred_formula,
-                               n.samples, seed) {
-  
+                               n.samples, seed, link = c("log", "cloglog")) {
+
+  link <- match.arg(link)
+
   preds <- predict_inla(
     mod = mod,
     grid = pred_grid,
@@ -2408,13 +2476,18 @@ predict_all_pixels <- function(mod, pred_grid, pred_formula,
     n.samples = n.samples,
     seed = seed
   )
-  
+
   idx2 <- which(pred_grid$Atlas == "OBBA2")
   idx3 <- which(pred_grid$Atlas == "OBBA3")
-  
+
   eta <- preds$eta
-  mu2 <- exp(eta[idx2, , drop = FALSE])
-  mu3 <- exp(eta[idx3, , drop = FALSE])
+  if (link == "log") {
+    mu2 <- exp(eta[idx2, , drop = FALSE])
+    mu3 <- exp(eta[idx3, , drop = FALSE])
+  } else {
+    mu2 <- 1 - exp(-exp(eta[idx2, , drop = FALSE]))
+    mu3 <- 1 - exp(-exp(eta[idx3, , drop = FALSE]))
+  }
   
   if (nrow(mu2) != nrow(mu3)) {
     stop("Prediction grid does not contain matched OBBA2/OBBA3 rows.")
@@ -2428,11 +2501,194 @@ predict_all_pixels <- function(mod, pred_grid, pred_formula,
 }
 
 
+# ==============================================================================
+# choose_prediction_survey()  --  which survey protocol to predict for
+#
+# By default, predictions are standardized to a 5-min point count at the fitted
+# peak hour (optimal_TOD) and days_midpoint = 0. For species far more detectable
+# on a targeted special survey (e.g. broadcast owl surveys), that protocol's
+# scale is the better-informed index, so predictions are made for it instead.
+#
+# Decision, in priority order:
+#   1. A priori override (named vector, sp_english -> Survey_Type). Used if the
+#      named type kept an intercept in THIS fit; "Point_Count" forces the
+#      default. A named type that was dropped (below its square threshold) gives
+#      a warning and falls through to step 2.
+#   2. Fitted contrast (when auto = TRUE). For each kept special type, posterior
+#      draws of
+#        log ratio = [effect_SS + TOD_global(type hour)*  + DOY_global(0)*]
+#                  - [            TOD_global(optimal_TOD) + DOY_global(0) ]
+#      (* only if that type shares the smooth). Intercept, spatial fields and
+#      covariates are common to both protocols at any location and cancel, so
+#      this is the protocol effect at a fixed place. A type qualifies when its
+#      median ratio >= min_ratio AND P(ratio > 1) >= min_prob; the qualifier
+#      with the largest median ratio wins.
+#   3. Otherwise the 5-min point count.
+#
+# Raw detection rates are deliberately NOT used: special surveys are placed
+# where the species is expected (marshes, owl habitat), so their raw rates mix
+# protocol with location. Under a log link the ratio is in expected count;
+# under cloglog (binomial) it is in detection intensity, lambda.
+#
+# mod           Fitted model. Only fit_PC_ARU_CL() fits carry special types;
+#               anything else returns the point-count default.
+# sp_english    Species name, matched against names(overrides).
+# template_row  One row of the prediction grid (sf). Replicated to build the
+#               contrast rows, so every component input generate() may evaluate
+#               is present.
+# optimal_TOD   Point-count reference hour (from 07a/07b, section 6.7b).
+# Returns a list: survey_type, effect_name (NULL for point counts),
+#   include_TOD, include_DOY, Hours_After_Reference, days_midpoint, source,
+#   contrasts (one row per kept special type; NULL if none).
+# ==============================================================================
+
+choose_prediction_survey <- function(mod,
+                                     sp_english,
+                                     template_row,
+                                     optimal_TOD,
+                                     overrides = character(0),
+                                     auto      = TRUE,
+                                     min_ratio = 2,
+                                     min_prob  = 0.95,
+                                     n_draws   = 500,
+                                     seed      = 0) {
+
+  # ---- Default: 5-min point count at the fitted peak hour ----
+  choice <- list(
+    survey_type           = "Point_Count",
+    effect_name           = NULL,
+    include_TOD           = TRUE,
+    include_DOY           = TRUE,
+    Hours_After_Reference = optimal_TOD,
+    days_midpoint         = 0,
+    source                = "default (5-min point count)",
+    contrasts             = NULL
+  )
+
+  override <- NA_character_
+  if (sp_english %in% names(overrides)) override <- overrides[[sp_english]]
+
+  if (identical(override, "Point_Count")) {
+    choice$source <- "a priori override"
+    return(choice)
+  }
+
+  special_types <- mod$special_survey_types   # NULL for fit_PC_ARU()
+
+  if (length(special_types) == 0) {
+    if (!is.na(override)) {
+      warning(sp_english, ": override '", override, "' ignored; this fit has ",
+              "no special-survey intercepts. Predicting for point counts.",
+              call. = FALSE)
+    }
+    return(choice)
+  }
+
+  slugs <- mod$special_slug[special_types]
+
+  # ---- Contrast rows: row 1 = point-count reference, then one per type ----
+  n_rows  <- length(special_types) + 1
+  newdata <- template_row[rep(1, n_rows), ]
+  newdata$Hours_After_Reference <- optimal_TOD
+  newdata$days_midpoint         <- 0
+  newdata$tod_w                 <- 1
+  newdata$doy_w                 <- 1
+  for (type in special_types) {
+    newdata[[slugs[[type]]]] <- 0
+  }
+
+  for (k in seq_along(special_types)) {
+    type <- special_types[k]
+    row  <- k + 1
+
+    newdata[[slugs[[type]]]][row] <- 1
+    newdata$tod_w[row] <- as.numeric(isTRUE(mod$special_share_tod[[type]]))
+    newdata$doy_w[row] <- as.numeric(isTRUE(mod$special_share_doy[[type]]))
+
+    # A TOD-sharing type is evaluated at its own typical hour; otherwise the
+    # hour is irrelevant (tod_w = 0) and stays at optimal_TOD, inside the mesh.
+    if (isTRUE(mod$special_share_tod[[type]])) {
+      newdata$Hours_After_Reference[row] <- mod$special_ref_TOD[[type]]
+    }
+  }
+
+  special_terms <- paste0(slugs, " * effect_", slugs, collapse = " + ")
+  contrast_formula <- stats::as.formula(paste0(
+    "~ data.frame(eta = ", special_terms,
+    " + tod_w * TOD_global + doy_w * DOY_global)"
+  ))
+
+  eta_draws <- predict_inla(
+    mod          = mod,
+    grid         = newdata,
+    pred_formula = contrast_formula,
+    n.samples    = n_draws,
+    seed         = seed
+  )$eta
+
+  # ---- Summarize each type's ratio to the point-count reference ----
+  contrasts <- data.frame(
+    survey_type     = special_types,
+    effect_name     = paste0("effect_", slugs),
+    ratio_q05       = NA_real_,
+    ratio_q50       = NA_real_,
+    ratio_q95       = NA_real_,
+    prob_ratio_gt_1 = NA_real_,
+    qualifies       = FALSE
+  )
+
+  for (k in seq_along(special_types)) {
+    ratio <- exp(eta_draws[k + 1, ] - eta_draws[1, ])   # paired draw by draw
+    contrasts$ratio_q05[k]       <- stats::quantile(ratio, 0.05)
+    contrasts$ratio_q50[k]       <- stats::median(ratio)
+    contrasts$ratio_q95[k]       <- stats::quantile(ratio, 0.95)
+    contrasts$prob_ratio_gt_1[k] <- mean(ratio > 1)
+    contrasts$qualifies[k]       <- contrasts$ratio_q50[k] >= min_ratio &&
+                                    contrasts$prob_ratio_gt_1[k] >= min_prob
+  }
+
+  choice$contrasts <- contrasts
+
+  # Switch the choice to a special type.
+  use_special <- function(choice, type, source) {
+    choice$survey_type <- type
+    choice$effect_name <- paste0("effect_", slugs[[type]])
+    choice$include_TOD <- isTRUE(mod$special_share_tod[[type]])
+    choice$include_DOY <- isTRUE(mod$special_share_doy[[type]])
+    if (choice$include_TOD) {
+      choice$Hours_After_Reference <- mod$special_ref_TOD[[type]]
+    }
+    choice$source <- source
+    choice
+  }
+
+  # ---- 1. A priori override ----
+  if (!is.na(override)) {
+    if (override %in% special_types) {
+      return(use_special(choice, override, "a priori override"))
+    }
+    warning(sp_english, ": override '", override, "' did not keep an ",
+            "intercept in this fit (absent or below its square threshold); ",
+            "using the fitted-contrast rule instead.", call. = FALSE)
+  }
+
+  # ---- 2. Fitted contrast ----
+  if (isTRUE(auto) && any(contrasts$qualifies)) {
+    qualifying <- contrasts[contrasts$qualifies, ]
+    best_type  <- qualifying$survey_type[which.max(qualifying$ratio_q50)]
+    return(use_special(choice, best_type, "fitted contrast"))
+  }
+
+  # ---- 3. Point-count default ----
+  choice
+}
+
+
 # ============================================================
 # 5. Lognormal variance correction
 # ============================================================
 #
-# Optional: 07 applies it only when vc_terms is non-empty (empty by default, in
+# Optional: 07a applies it only when vc_terms is non-empty (empty by default, in
 # which case the factor is 1 and predictions stay on the geometric scale).
 #
 # Rationale
@@ -2482,7 +2738,7 @@ predict_all_pixels <- function(mod, pred_grid, pred_formula,
 # for species with and without a site random effect.
 #
 # hyper     summary.hyperpar table: mod$summary.hyperpar, or the
-#           summary_hyperpar element saved by script 07.
+#           summary_hyperpar element saved by 07a/07b.
 # name      Component name as written in the model components, e.g. "site_iid".
 # quantile  Column to read. "0.5quant" gives the posterior median precision;
 #           because medians are invariant to monotone transformation,
@@ -2718,6 +2974,61 @@ describe_lognormal_correction <- function(vc, digits = 3) {
   )
 }
 
+
+# ------------------------------------------------------------
+# Presence/absence (cloglog) counterpart of the lognormal correction
+# ------------------------------------------------------------
+# exp(sigma^2 / 2) is specific to the log link. Under cloglog, the probability
+# averaged over the omitted iid levels is
+#
+#     E[ 1 - exp(-exp(eta + z)) ],    z ~ N(0, sigma^2)
+#
+# which has no closed form, so it is integrated by Gauss-Hermite quadrature
+# (the same idea as the probability-of-observation integration in script 09).
+# Without it, mapped probabilities are for the median square/site and are
+# biased low for patchily distributed species.
+
+# Gauss-Hermite nodes and weights (physicists' convention, weight exp(-x^2)),
+# by the Golub-Welsch eigenvalue method. Base R only.
+gauss_hermite_rule <- function(n_nodes = 20) {
+  stopifnot(n_nodes >= 1)
+  jacobi <- matrix(0, n_nodes, n_nodes)
+  if (n_nodes > 1) {
+    off_diagonal <- sqrt(seq_len(n_nodes - 1) / 2)
+    for (i in seq_len(n_nodes - 1)) {
+      jacobi[i, i + 1] <- off_diagonal[i]
+      jacobi[i + 1, i] <- off_diagonal[i]
+    }
+  }
+  eig <- eigen(jacobi, symmetric = TRUE)
+  list(nodes   = eig$values,
+       weights = sqrt(pi) * eig$vectors[1, ]^2)
+}
+
+# Integrate cloglog probabilities over an omitted N(0, sigma2) effect.
+#
+# eta      Matrix of linear-predictor draws (pixel x draw).
+# sigma2   Total omitted variance (e.g. sum of get_var() over the iid terms).
+# n_nodes  Quadrature nodes; 20 is ample for sigma up to ~3.
+# Returns a matrix of probabilities, same shape as eta.
+marginalize_cloglog_iid <- function(eta, sigma2, n_nodes = 20) {
+
+  stopifnot(is.matrix(eta), length(sigma2) == 1, is.finite(sigma2), sigma2 >= 0)
+
+  if (sigma2 == 0) return(1 - exp(-exp(eta)))
+
+  rule <- gauss_hermite_rule(n_nodes)
+  prob <- matrix(0, nrow = nrow(eta), ncol = ncol(eta))
+
+  # E[f(z)] = sum_k w_k f(sqrt(2 * sigma2) * x_k) / sqrt(pi)
+  for (k in seq_along(rule$nodes)) {
+    z    <- sqrt(2 * sigma2) * rule$nodes[k]
+    prob <- prob + rule$weights[k] / sqrt(pi) * (1 - exp(-exp(eta + z)))
+  }
+
+  prob
+}
+
 # ============================================================
 # 6. Posterior summaries
 # ============================================================
@@ -2874,7 +3185,7 @@ make_shared_footprint_dataset <- function(
 }
 
 # Fits only point counts and ARUs. The ARU offset (effect_ARU) is included only
-# when ARU rows are present; 07b passes point counts only, so it is omitted.
+# when ARU rows are present; 07c passes point counts only, so it is omitted.
 fit_inla_shared_footprint_change <- function(
     sp_dat_shared,
     region_col = "BCR",
@@ -3008,7 +3319,7 @@ fit_inla_shared_footprint_change <- function(
   
   # --- Time-of-day smooth: SHARED mesh, FIXED range ---------------------------
   # Pass mesh_TOD to share one basis across species; otherwise a mesh is built
-  # from fixed_TOD_range (07b does this).
+  # from fixed_TOD_range (07c does this).
   #
   # prior.range = c(range0, NA) -> range HELD FIXED at range0 (no prior).
   # Only sigma is estimated.
@@ -3041,7 +3352,7 @@ fit_inla_shared_footprint_change <- function(
   
   # --- Day-of-year smooth: FIXED range, sigma estimated ----------------------
   # Gives the paired analysis the same seasonal detectability adjustment as the
-  # full model in script 07. Modelled exactly like
+  # full model in script 07a. Modelled exactly like
   # the TOD smooth above: a 1-D SPDE with the RANGE HELD FIXED at fixed_DOY_range
   # and only sigma estimated. The domain is NOT cyclic -- days_midpoint is a
   # linear axis centred on the species' safe-date midpoint (0), so a free mesh is
@@ -3050,7 +3361,7 @@ fit_inla_shared_footprint_change <- function(
   # without competing with the change_* fixed effects.
   #
   # When mesh_DOY is not supplied it is built to span this species' observed
-  # days_midpoint range (+/- 7 d), matching how script 07 sizes its per-species
+  # days_midpoint range (+/- 7 d), matching how script 07a sizes its per-species
   # DOY mesh. Pass mesh_DOY explicitly to share one basis across species.
   if (is.null(mesh_DOY)) {
     DOY_obs_range <- range(sp_dat_shared$days_midpoint, na.rm = TRUE)

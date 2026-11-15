@@ -10,7 +10,7 @@
 #   against independent trends (e.g. the Breeding Bird Survey, BBS).
 #
 #   Running order: this script comes BEFORE 09_generate_model_products.R. It only
-#   needs 07's prediction files (and, optionally, 07b's paired summaries); it does
+#   needs 07a's or 07b's prediction files (and, optionally, 07c's paired summaries); it does
 #   not depend on any figures.
 #
 # Speed
@@ -34,7 +34,14 @@
 #   - "province" is the whole study boundary; the per-BCR rows loop over every
 #     row of bcr_regions (BCR 12, 13, 74, 76, 77).
 #   - pct_change_* columns are 100 * prop_change_* (proportional change, %).
-#   - The paired ("shared-footprint") export from 07b is a STANDALONE analysis,
+#   - Works on either fitting script's output (set model_name below). For 07a,
+#     region totals are area-weighted sums of expected count, so prop_change is
+#     relative change in abundance. For 07b (presence/absence), they are sums of
+#     detection probability, so prop_change is relative change in MEAN DETECTION
+#     PROBABILITY -- bounded above, and compressed where the species is common.
+#     Each row carries response_scale and prediction_survey_type from its
+#     prediction file so the two can never be confused downstream.
+#   - The paired ("shared-footprint") export from 07c is a STANDALONE analysis,
 #     not a variant of this model, so it is written to a model-independent folder
 #     (change_estimates/) with no model_name suffix. Script 10 loads it as the
 #     plain source "paired".
@@ -58,7 +65,10 @@ source(file.path(paths$functions, "model_product_utils.R"))
 # CONFIG
 # ============================================================
 
-model_name <- "PC_ARU_CL_SS"
+# Output folder suffix of the 07a or 07b run to summarise (must match 09):
+#   07a (abundance):              e.g. "PC_ARU_CL_SS"
+#   07b (presence/absence):       e.g. "PC_ARU_CL_SS_PA"
+model_name <- "PC_ARU_CL_SS_PA"
 
 # Zero predictions (pixel summaries and hex draws) in biological regions where
 # the species has no safe dates, using each prediction file's own sp_safe_dates.
@@ -90,7 +100,7 @@ MASK_INSUFFICIENT <- FALSE
 min_sq_det        <- 10
 
 # Also export the repeated-survey-only ("paired" / shared-footprint) change
-# estimates from 07b, when available. These are often the MOST directly
+# estimates from 07c, when available. These are often the MOST directly
 # comparable quantity to BBS, since both are trends from revisited stations.
 INCLUDE_PAIRED <- TRUE
 
@@ -119,7 +129,7 @@ paired_analysis_path <- file.path(paths$model_output, "paired_summaries",
 
 # NOTE: safe-date trimming below does NOT re-read the Excel. The regions to zero
 # come from each prediction file's own sp_safe_dates (the ORIGINAL, unmodified
-# definitions that 06 built and 07 shipped with the predictions), so 08 has a
+# definitions that 06 built and 07a/07b shipped with the predictions), so 08 has a
 # single source of truth that cannot drift from what the model was fit against.
 
 dir.create(out_dir,        recursive = TRUE, showWarnings = FALSE)
@@ -290,7 +300,11 @@ for (i in seq_along(dat_used_files)) {
   }
   
   preds     <- readRDS(pred_path)
-  
+
+  # Expected count (07a) or detection probability (07b), and for which survey
+  # type; written into every row so the table is self-describing.
+  scale_labels <- prediction_scale_labels(preds)
+
   # Trim out predictions for areas with no safe dates
   # NOTE: this ensures a species cannot occur in a region where it has no safe dates
   if (TRIM_TO_SAFE_DATES) {
@@ -308,7 +322,7 @@ for (i in seq_along(dat_used_files)) {
   if (is.null(hex_draws)) {
     message("Skipping ", sp_english,
             "; prediction file has no hex_draws_Corrected_for_Water. ",
-            "Rerun 07 for this species.")
+            "Rerun 07a (or 07b) for this species.")
     next
   }
   
@@ -389,6 +403,8 @@ for (i in seq_along(dat_used_files)) {
       sp_file    = sp_file,
       species_id = sp_code,
       model_name = model_name,
+      response_scale         = scale_labels$response_scale,
+      prediction_survey_type = scale_labels$survey_type,
       ci_level   = ci_level,
       .before = 1
     ) %>%
@@ -404,6 +420,8 @@ for (i in seq_along(dat_used_files)) {
   if (SAVE_DRAWS) {
     draws_list[[i]] <- list(
       sp_english = sp_english, sp_file = sp_file, species_id = sp_code,
+      response_scale         = scale_labels$response_scale,
+      prediction_survey_type = scale_labels$survey_type,
       province = sr$draws$province, bcr = sr$draws[bcr_regions$BCR]
     )
   }
@@ -438,9 +456,9 @@ if (SAVE_DRAWS) {
 # ============================================================
 # Optional: repeated-survey (paired / shared-footprint) estimates
 #
-# These come straight from 07b's paired_summaries and are per-BCR. They are a
+# These come straight from 07c's paired_summaries and are per-BCR. They are a
 # separate, more directly BBS-comparable quantity that does NOT belong to any
-# single 07 model, so they are written to the model-independent change_estimates/
+# single 07a/07b model, so they are written to the model-independent change_estimates/
 # folder with no model_name suffix. Script 10 loads them as the source "paired".
 # ============================================================
 

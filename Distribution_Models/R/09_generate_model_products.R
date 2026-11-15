@@ -20,10 +20,23 @@
 #   and summarised by vector indexing.
 #   Set cfg$report_timings = TRUE to log time per step for each species.
 #
-#   If available, 07b's paired_summaries.rds is used for the page-3 repeated-
+#   If available, 07c's paired_summaries.rds is used for the page-3 repeated-
 #   survey comparison (change estimates, locations map, and summary table). It is
 #   optional: species with full-model predictions still receive the full PDF when
 #   no paired result exists.
+#
+# Abundance (07a) vs presence/absence (07b) outputs
+#   Set model_name below to the folder suffix of the run to process. Each
+#   prediction file records what it contains (response_scale, read through
+#   prediction_scale_labels()), so the same code produces both kinds of PDF:
+#     07a  maps of expected count; page-3 change in abundance; honeycomb circles
+#          = observed count per survey-minute.
+#     07b  maps of detection probability; page-3 change in mean detection
+#          probability; honeycomb circles = observed proportion of surveys with
+#          a detection.
+#   Either way, maps are for one survey of the species' prediction survey type
+#   (a 5-min point count unless 07a/07b chose a special survey), and every
+#   legend and raster tag says which.
 #
 # Main outputs
 #   - model_output/rasters_<model_name>/<species>_{a2,a3,chg}.tif
@@ -61,7 +74,10 @@ source(file.path(paths$functions, "inla_model_utils.R"))   # get_var()
 # CONFIG
 # ============================================================
 
-model_name <- "PC_ARU_CL_SS"
+# Output folder suffix of the 07a or 07b run to process (must match 08):
+#   07a (abundance):              e.g. "PC_ARU_CL_SS"
+#   07b (presence/absence):       e.g. "PC_ARU_CL_SS_PA"
+model_name <- "PC_ARU_CL_SS_PA"
 
 # Zero predictions (pixel summaries and hex draws) in biological regions where
 # the species has no safe dates, using each prediction file's own sp_safe_dates.
@@ -105,7 +121,8 @@ cfg <- list(
   # the predicted population. Then CAP that cutoff at relabund_absent_limit =
   # 1/1000 expected birds per standardized 5-min count. Thus the final threshold
   # is min(T_99%, 1/1000): the 99% rule can make the map more inclusive, but can
-  # never mask values above 1/1000.
+  # never mask values above 1/1000. For 07b outputs the same rule applies to
+  # detection probability (cap = probability 0.001 per survey).
   relabund_coverage = 0.99,
   relabund_absent_limit = 1/1000,
   
@@ -208,7 +225,7 @@ if ("ci_level" %in% names(regional_change_all)) {
   }
 }
 
-# Geometry only. Prediction rows in 07 align with the FULL grids, so the grids
+# Geometry only. Prediction rows in 07a/07b align with the FULL grids, so the grids
 # are not na.omit()'d (doing so would misalign values if any row were dropped).
 grid2          <- dat$grid_OBBA2["pixel_id"]
 grid3          <- dat$grid_OBBA3["pixel_id"]
@@ -347,7 +364,7 @@ for (i in seq_along(dat_used_files)) {
   
   dat_used <- readRDS(dat_used_files[i])
   
-  # sp_file is taken from the filename so it always matches the names script 07
+  # sp_file is taken from the filename so it always matches the names 07a/07b
   # used for the prediction and raster files.
   sp_file    <- basename(dat_used_files[i]) |> stringr::str_remove("_1km\\.rds$")
   sp_english <- dat_used$sp_english
@@ -393,22 +410,30 @@ for (i in seq_along(dat_used_files)) {
   # Reconstruct this species' survey sf (geometry + attributes + count) by
   # rejoining the lightweight count table to the shared all_surveys table.
   sp_surveys <- load_species_surveys(dat_used, all_surveys)
-  
+
+  # 07a (counts) or 07b (presence/absence)? Read from the data record, so it is
+  # known even for honeycomb-only species, which have no prediction file. For
+  # 07b, count in the record is the 0/1 response the model saw.
+  is_PA <- isTRUE(prediction_scale_labels(dat_used)$is_probability)
+
   # ----------------------------------------------------------
   # Honeycomb-only branch for species without model predictions
   # ----------------------------------------------------------
-  
+
   if (!has_model) {
     message("Honeycomb-only maps for ", sp_english, " (no model predictions available).")
-    
-    honey_prep <- prepare_honeycomb_surveys(sp_surveys)
+
+    honey_prep <- prepare_honeycomb_surveys(sp_surveys, per_minute = !is_PA)
     A2_obs     <- honey_prep$data %>% dplyr::filter(Atlas == "OBBA2")
     A3_obs     <- honey_prep$data %>% dplyr::filter(Atlas == "OBBA3")
     A2_special <- honey_prep$special %>% dplyr::filter(Atlas == "OBBA2")
     A3_special <- honey_prep$special %>% dplyr::filter(Atlas == "OBBA3")
-    
-    honey_size_label <- honeycomb_size_label(honey_prep$per_minute)
-    page_subtitle    <- if (honey_prep$per_minute) {
+
+    honey_size_label <- honeycomb_size_label(per_minute     = honey_prep$per_minute,
+                                             detection_rate = is_PA)
+    page_subtitle    <- if (is_PA) {
+      "Observed survey effort and detection rates (no model fitted)"
+    } else if (honey_prep$per_minute) {
       "Observed survey effort and mean counts per survey-minute (no model fitted)"
     } else {
       "Observed survey effort and mean counts (no model fitted)"
@@ -465,7 +490,15 @@ for (i in seq_along(dat_used_files)) {
   tick  <- make_step_timer(cfg$report_timings)
   preds <- readRDS(pred_path)
   tick("read predictions")
-  
+
+  # What the surfaces are (expected count vs detection probability) and for
+  # which survey type; drives every label, raster tag and the page-14 path.
+  scale_labels <- prediction_scale_labels(preds)
+  if (scale_labels$is_probability != is_PA) {
+    stop(sp_english, ": prediction file and data record disagree on response ",
+         "scale; rerun 07a/07b for this species.", call. = FALSE)
+  }
+
   # Trim out predictions for areas with no safe dates
   # NOTE: this ensures a species cannot occur in a region where it has no safe dates
   if (TRIM_TO_SAFE_DATES) {
@@ -507,28 +540,31 @@ for (i in seq_along(dat_used_files)) {
   
   # Filled from the precomputed pixel -> cell index (no per-species geometry).
   # Both the median and the interval width come from the water-corrected summaries.
-  # CI_90_width = 95th - 5th posterior percentile (the interval 07 summarises).
+  # CI_90_width = 95th - 5th posterior percentile (the interval 07a/07b summarise).
   p2   <- preds$OBBA2_Corrected_for_Water
   p3   <- preds$OBBA3_Corrected_for_Water
   pchg <- preds$abs_change_Corrected_for_Water
   meta <- c(species_name = sp_english, species_id = sp_code,
-            species_filename = sp_file, model_name = model_name)
-  
+            species_filename = sp_file, model_name = model_name,
+            response_scale         = scale_labels$response_scale,
+            prediction_survey_type = scale_labels$survey_type)
+
   r2 <- rasterize_from_index(
     index    = rast_index2,
     values   = list(mu_q50 = p2$OBBA2_q50, CI_90_width = p2$OBBA2_upper - p2$OBBA2_lower),
-    metadata = c(meta, units = "Expected count (Atlas 2)")
+    metadata = c(meta, units = paste0(scale_labels$value_label, " (Atlas 2)"))
   )
   r3 <- rasterize_from_index(
     index    = rast_index3,
     values   = list(mu_q50 = p3$OBBA3_q50, CI_90_width = p3$OBBA3_upper - p3$OBBA3_lower),
-    metadata = c(meta, units = "Expected count (Atlas 3)")
+    metadata = c(meta, units = paste0(scale_labels$value_label, " (Atlas 3)"))
   )
   rchg <- rasterize_from_index(
     index    = rast_index3,
     values   = list(chg_q50 = pchg$abs_change_q50,
                     CI_90_width = pchg$abs_change_upper - pchg$abs_change_lower),
-    metadata = c(meta, units = "Change in expected counts (Atlas 2 to Atlas 3)")
+    metadata = c(meta, units = paste0("Change in ", tolower(scale_labels$value_label),
+                                      " (Atlas 2 to Atlas 3)"))
   )
   tick("rasterize")
   
@@ -625,7 +661,8 @@ for (i in seq_along(dat_used_files)) {
     map_confidence    = cfg$map_change_confidence,
     zlim              = rasters_relabund_prepared$zlim,
     water             = NULL,
-    water_fill        = "gray97"
+    water_fill        = "gray97",
+    change_quantity   = scale_labels$change_quantity
   )
   tick("hex change map")
   
@@ -644,10 +681,10 @@ for (i in seq_along(dat_used_files)) {
     dplyr::relocate(Region_Name, Region_Number)
   
   # ---- Paired analysis (surveys within shared 100 m footprint) ----
-  # Optional. If 07b has no result for this species, all full-model products are
+  # Optional. If 07c has no result for this species, all full-model products are
   # still generated and only the paired-analysis elements on page 3 are omitted.
   if (has_paired) {
-    # NOTE: 07b must summarize by BCR; require_bcr_key() fails loudly on
+    # NOTE: 07c must summarize by BCR; require_bcr_key() fails loudly on
     # Biol_Region-keyed files.
     paired_change_summary <- paired$shared_change_summary %>%
       require_bcr_key("shared_change_summary", sp_english) %>%
@@ -703,16 +740,32 @@ for (i in seq_along(dat_used_files)) {
     paired_change_summary_masked <- NULL
   }
   
-  change_comparison_plot <- make_change_comparison_plot(
-    regional_estimates_FullModel = regional_estimates_FullModel_masked,
-    paired_change_summary        = paired_change_summary_masked,
-    region_order = region_label_order,
-    title    = "Regional population change estimates",
-    subtitle = if (has_paired) {
+  # For 07b the full model's change is in mean DETECTION PROBABILITY, while the
+  # paired (07c) change is in mean COUNT, so the two are labelled as different
+  # quantities rather than presented as like-for-like.
+  if (scale_labels$is_probability) {
+    change_plot_title    <- "Regional change estimates"
+    change_plot_subtitle <- if (has_paired) {
+      "Full model: change in detection probability; repeated surveys: change in mean count"
+    } else {
+      "Full atlas model: change in detection probability"
+    }
+  } else {
+    change_plot_title    <- "Regional population change estimates"
+    change_plot_subtitle <- if (has_paired) {
       "Comparison of full atlas model vs repeated surveys only"
     } else {
       "Full atlas model"
     }
+  }
+
+  change_comparison_plot <- make_change_comparison_plot(
+    regional_estimates_FullModel = regional_estimates_FullModel_masked,
+    paired_change_summary        = paired_change_summary_masked,
+    region_order = region_label_order,
+    title    = change_plot_title,
+    subtitle = change_plot_subtitle,
+    x_label  = scale_labels$change_axis_label
   )
   
   if (has_paired) {
@@ -753,12 +806,13 @@ for (i in seq_along(dat_used_files)) {
   # Survey data prepared once, then assessed per region
   # ----------------------------------------------------------
   
-  honey_prep     <- prepare_honeycomb_surveys(sp_surveys)
+  honey_prep     <- prepare_honeycomb_surveys(sp_surveys, per_minute = !is_PA)
   A2_dat_to_plot <- honey_prep$data %>% dplyr::filter(Atlas == "OBBA2")
   A3_dat_to_plot <- honey_prep$data %>% dplyr::filter(Atlas == "OBBA3")
   A2_special     <- honey_prep$special %>% dplyr::filter(Atlas == "OBBA2")
   A3_special     <- honey_prep$special %>% dplyr::filter(Atlas == "OBBA3")
-  honey_size_label <- honeycomb_size_label(honey_prep$per_minute)
+  honey_size_label <- honeycomb_size_label(per_minute     = honey_prep$per_minute,
+                                           detection_rate = is_PA)
   
   # One unified call per region defined in region_defs.
   assessments <- lapply(region_specs, function(spec) {
@@ -780,7 +834,8 @@ for (i in seq_along(dat_used_files)) {
       count_max_q       = cfg$count_max_q,
       max_surveys_q     = cfg$max_surveys_q,
       transform         = cfg$relabund_transform,
-      count_size_label  = honey_size_label
+      count_size_label  = honey_size_label,
+      rast_legend_title = scale_labels$legend_title
     )
   })
   names(assessments) <- names(region_specs)
@@ -789,32 +844,54 @@ for (i in seq_along(dat_used_files)) {
   # ----------------------------------------------------------
   # Probability-of-observation maps (Page 14)
   # ----------------------------------------------------------
-  # Per-survey detection probability for one 5-min count at a random square in
-  # the pixel's neighbourhood. Built directly on the single-layer median surface
-  # (NOT via prepare_relative_abundance_rasters, whose density floor and 0.99
-  # clamp are for abundance) so the full 0-1 colour scale is available.
-  
-  # Integrate only the omitted iid terms NOT already baked into q50 (none when
-  # vc_terms was empty in 07), so nothing is double-counted.
-  vc_present    <- preds$variance_correction$present
-  applied_terms <- if (is.null(vc_present)) character(0) else names(which(vc_present))
-  marg_terms    <- setdiff(cfg$pobs_marginalize_terms, applied_terms)
-  
+  # Per-survey detection probability for one survey of the prediction survey
+  # type (usually a 5-min count) at a random square in the pixel's
+  # neighbourhood. Built directly on the single-layer median surface (NOT via
+  # prepare_relative_abundance_rasters, whose density floor and 0.99 clamp are
+  # for abundance) so the full 0-1 colour scale is available.
+
+  # Integrate only the omitted iid terms NOT already baked into q50, so nothing
+  # is double-counted. The two fitting scripts record this differently:
+  #   07a: variance_correction$present names the terms its lognormal factor used
+  #        (none when its vc_terms was empty);
+  #   07b: variance_correction$terms were integrated when sigma2_iid > 0.
+  vc_record <- preds$variance_correction
+  if (!is.null(vc_record$present)) {
+    applied_terms <- names(which(vc_record$present))
+  } else if (isTRUE(vc_record$sigma2_iid > 0)) {
+    applied_terms <- vc_record$terms
+  } else {
+    applied_terms <- character(0)
+  }
+  marg_terms <- setdiff(cfg$pobs_marginalize_terms, applied_terms)
+
   sigma2_omit <- sum(vapply(marg_terms,
                             function(tm) get_var(hyper = preds$summary_hyperpar, name = tm),
                             numeric(1)))
-  nb_size     <- nb_size_from_hyper(preds$summary_hyperpar)
-  
+
+  # 07a maps expected counts, used as lambda directly (nbinomial size if fitted).
+  # 07b maps probabilities: lambda = -log(1 - p) is the cloglog inverse, and its
+  # zero probability is exp(-lambda), i.e. Poisson-like (size = Inf).
+  if (scale_labels$is_probability) {
+    lambda2 <- probability_to_lambda(r2[["mu_q50"]])
+    lambda3 <- probability_to_lambda(r3[["mu_q50"]])
+    nb_size <- Inf
+  } else {
+    lambda2 <- r2[["mu_q50"]]
+    lambda3 <- r3[["mu_q50"]]
+    nb_size <- nb_size_from_hyper(preds$summary_hyperpar)
+  }
+
   pobs2 <- marginal_pobs(
-    r2[["mu_q50"]],
+    lambda2,
     sigma2_omit = sigma2_omit,
     size = nb_size,
     n_nodes = cfg$pobs_gh_nodes,
     n_surveys = cfg$pobs_n_surveys
   )
-  
+
   pobs3 <- marginal_pobs(
-    r3[["mu_q50"]],
+    lambda3,
     sigma2_omit = sigma2_omit,
     size = nb_size,
     n_nodes = cfg$pobs_gh_nodes,
@@ -829,19 +906,25 @@ for (i in seq_along(dat_used_files)) {
   pobs2 <- clip_to_region_mask(pobs2, region_specs$province$index$mask)
   pobs3 <- clip_to_region_mask(pobs3, region_specs$province$index$mask)
   
+  # Labels name the prediction survey type and the configured number of surveys.
+  pobs_subtitle <- paste0("Probability of ≥1 Detection Across ", cfg$pobs_n_surveys,
+                          " Independent ", scale_labels$pobs_surveys_label)
+  pobs_legend   <- paste0("P(≥1 detection)\nacross ", cfg$pobs_n_surveys, "\n",
+                          scale_labels$pobs_legend_noun)
+
   pobs_Map_Atlas2 <- make_map(
-    species_name = sp_english, 
-    subtitle = "Probability of ≥1 Detection Across 25 Independent 5-min Point Counts - Atlas 2",
-    legend_title = "P(≥1 detection)\nacross 25\npoint counts",
+    species_name = sp_english,
+    subtitle = paste0(pobs_subtitle, " - Atlas 2"),
+    legend_title = pobs_legend,
     rast = pobs2, region = study_boundary, clipped = TRUE,
     water = NULL, colpal = colpal_pobs, water_fill = "white",
     transform = "identity", zlim = c(0, 1), zbreaks = seq(0, 1, length.out = 5)
   )
-  
+
   pobs_Map_Atlas3 <- make_map(
-    species_name = sp_english, 
-    subtitle = "Probability of ≥1 Detection Across 25 Independent 5-min Point Counts - Atlas 3",
-    legend_title = "P(≥1 detection)\nacross 25\npoint counts",
+    species_name = sp_english,
+    subtitle = paste0(pobs_subtitle, " - Atlas 3"),
+    legend_title = pobs_legend,
     rast = pobs3, region = study_boundary, clipped = TRUE,
     water = NULL, colpal = colpal_pobs, water_fill = "white",
     transform = "identity", zlim = c(0, 1), zbreaks = seq(0, 1, length.out = 5)

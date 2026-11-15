@@ -1,23 +1,23 @@
 # ============================================================
-# 07b_fit_models_to_shared_footprint.R   (paired analysis)
+# 07c_fit_models_to_shared_footprint.R   (paired analysis)
 #
 # Purpose
 #   Estimate OBBA2 -> OBBA3 change from the subset of surveys that fall inside
 #   the footprint shared by both atlases, using point counts only. This is a
-#   design-based counterpart to the full spatio-temporal model in script 07, and
+#   design-based counterpart to the full spatio-temporal model in script 07a, and
 #   carries the same detectability smooths as that model: a day-of-year (DOY)
 #   smooth alongside the time-of-day (TOD) smooth, so the two analyses adjust for
 #   within-season and within-day survey timing the same way.
 #
-#   This "paired" analysis is a standalone alternative to the 07 model, NOT a
-#   variant of it: it is run separately and never tied to a specific 07 mode.
+#   This "paired" analysis is a standalone alternative to the 07a/07b models, NOT a
+#   variant of it: it is run separately and never tied to a specific 07a/07b mode.
 #   Its output is therefore stored model-independently and
 #   is referred to simply as "paired" downstream (08 exports it; 10 compares it).
 #
 # Per-species data
-#   Reads the same per-species records written by script 06 as script 07 does,
+#   Reads the same per-species records written by script 06 as 07a/07b do,
 #   but narrows them to point counts (5-minute surveys), then to the shared
-#   footprint. Script 07 does NOT need to have been run first.
+#   footprint. Neither 07a nor 07b needs to have been run first.
 #
 # Output
 #   model_output/paired_summaries/paired_summaries.rds
@@ -45,7 +45,7 @@ source(here::here("R", "00_config_paths.R"))
 source(file.path(paths$functions, "inla_model_utils.R"))
 
 # Species-selection thresholds (see section 4). Deliberately lower than script
-# 07's: the paired model is much simpler, so it can support fewer detections.
+# 07a's: the paired model is much simpler, so it can support fewer detections.
 min_detections <- 10
 min_squares    <- 10
 
@@ -54,7 +54,7 @@ shared_radius_km <- 0.100
 
 # Negative-binomial switch thresholds (see choose_error_family()). Evaluated on
 # the shared-footprint point counts this script actually fits, so the family may
-# differ from script 07.
+# differ from script 07a.
 nb_switch_count <- 20
 nb_switch_min_n <- 20
 
@@ -116,7 +116,7 @@ if (!dir.exists(species_dir)) {
 # ============================================================
 # 4. Select species to model
 # ============================================================
-# Rule specific to this script (script 07 uses assess_modelability()): a
+# Rule specific to this script (07a/07b use assess_modelability()): a
 # species is run if, in at least one Atlas x PC/ARU stratum of
 # species_detection_summaries, it has >= min_detections detections and
 # > min_squares detected squares.
@@ -268,4 +268,4 @@ for (i in seq_along(model_ids)) {
   save_atomic(paired_summaries, paired_summaries_path)
 }
 
-message("\n07b_fit_models_to_shared_footprint.R complete.")
+message("\n07c_fit_models_to_shared_footprint.R complete.")

@@ -20,6 +20,8 @@
 #   Rasterization & scaling
 #     resolve_positive_max, resolve_rast_max, compute_assessment_scale_limits,
 #     prepare_relative_abundance_rasters, prepare_change_raster
+#   What a prediction file contains (07a counts vs 07b probabilities)
+#     prediction_scale_labels, probability_to_lambda
 #   Safe-date trimming and probability of observation
 #     grid_region_lookup, trim_predictions_to_safe_dates, marginal_pobs,
 #     nb_size_from_hyper   (iid variances come from get_var() in inla_model_utils.R)
@@ -45,6 +47,92 @@
 # Sourced by 08 and 09 (09 also sources spatial_utils.R for make_hex_grid() and
 # inla_model_utils.R for get_var()).
 # ============================================================
+
+
+# ------------------------------------------------------------
+# Describe what one prediction file's surfaces are, for labels and processing.
+#
+# 07a writes expected counts and 07b writes probabilities of detection
+# (preds$response_scale), each for ONE survey of preds$prediction_survey_type:
+# a 5-min point count unless 07a/07b chose a special survey for the species.
+# Files written before these fields existed are treated as 07a expected counts
+# for a 5-min point count.
+#
+# preds  One prediction record (readRDS of a 07a/07b output file), or a 07a/07b
+#        data_used record (which carries response_scale but no survey type).
+#
+# Returns a list of plain-text labels:
+#   response_scale     "expected_count" or "probability"
+#   is_probability     TRUE for 07b outputs
+#   survey_type        Survey_Type predicted for ("Point_Count" or a special type)
+#   survey_label       e.g. "5-min point count" or "Northern Ontario Owl Survey"
+#   value_label        e.g. "Expected count per 5-min point count"
+#   legend_title       short, multi-line title for the prediction-map legend
+#   change_quantity    first words of the change-map legend ("Population changed ...")
+#   change_axis_label  x-axis title of the regional change plot
+#   pobs_surveys_label plural survey wording for the probability-of-observation page
+#   pobs_legend_noun   short plural noun for that page's legend
+# ------------------------------------------------------------
+prediction_scale_labels <- function(preds) {
+
+  response_scale <- preds$response_scale
+  if (is.null(response_scale)) response_scale <- "expected_count"
+  if (!response_scale %in% c("expected_count", "probability")) {
+    stop("prediction_scale_labels(): unknown response_scale '", response_scale,
+         "'; expected 'expected_count' (07a) or 'probability' (07b).", call. = FALSE)
+  }
+  is_probability <- response_scale == "probability"
+
+  survey_type <- preds$prediction_survey_type
+  if (is.null(survey_type)) survey_type <- "Point_Count"
+  is_point_count <- survey_type == "Point_Count"
+
+  if (is_point_count) {
+    survey_label       <- "5-min point count"
+    pobs_surveys_label <- "5-min Point Counts"
+    pobs_legend_noun   <- "point counts"
+  } else {
+    survey_label       <- survey_type
+    pobs_surveys_label <- paste0("Surveys (", survey_type, ")")
+    pobs_legend_noun   <- "surveys"
+  }
+
+  if (is_probability) {
+    value_label       <- paste0("Probability of detection on one ", survey_label)
+    legend_title      <- paste0("Detection\nprobability\n(", survey_label, ")")
+    change_quantity   <- "Detection\nprobability"
+    change_axis_label <- "Estimated change in detection probability (%)"
+  } else {
+    value_label       <- paste0("Expected count per ", survey_label)
+    legend_title      <- paste0("Relative abundance\n(", survey_label, ")")
+    change_quantity   <- "Population"
+    change_axis_label <- "Estimated population change (%)"
+  }
+
+  list(
+    response_scale     = response_scale,
+    is_probability     = is_probability,
+    survey_type        = survey_type,
+    survey_label       = survey_label,
+    value_label        = value_label,
+    legend_title       = legend_title,
+    change_quantity    = change_quantity,
+    change_axis_label  = change_axis_label,
+    pobs_surveys_label = pobs_surveys_label,
+    pobs_legend_noun   = pobs_legend_noun
+  )
+}
+
+# Convert a probability-of-detection raster (07b) back to detection intensity,
+# lambda = -log(1 - p), the cloglog inverse. marginal_pobs() can then treat it
+# exactly like a 07a expected-count surface with size = Inf (Bernoulli/cloglog
+# has the same zero probability, exp(-lambda), as a Poisson count). p is capped
+# just below 1 so lambda stays finite.
+probability_to_lambda <- function(prob_rast) {
+  stopifnot(inherits(prob_rast, "SpatRaster"))
+  prob_rast <- terra::clamp(prob_rast, lower = 0, upper = 1 - 1e-12, values = TRUE)
+  -log(1 - prob_rast)
+}
 
 
 # ------------------------------------------------------------
@@ -82,13 +170,13 @@ grid_region_lookup <- function(grid, region_col = "Biol_Region") {
 # ------------------------------------------------------------
 # Zero every prediction product for regions the species has no safe dates in.
 #
-# preds                  One prediction record (readRDS of a 07 output file).
+# preds                  One prediction record (readRDS of a 07a/07b output file).
 # lookup_obba2           grid_region_lookup(dat$grid_OBBA2).
 # lookup_obba3           grid_region_lookup(dat$grid_OBBA3).
 # safe_regions           Regions WITH safe dates. NULL -> derived from
 #                        preds$sp_safe_dates: the regions whose start_doy/end_doy
 #                        are non-NA. preds$sp_safe_dates is the ORIGINAL
-#                        (unmodified) table written by 06/07, which lists EVERY
+#                        (unmodified) table written by 06/07a/07b, which lists EVERY
 #                        region with NA windows where the species has no safe
 #                        dates -- so safety is judged by the window, not by the
 #                        mere presence of a Biol_Region row.
@@ -1354,18 +1442,21 @@ get_min_supported_change_scale <- function() {
 }
 
 
-make_min_supported_change_legend <- function(ci_level = 0.90) {
-  
+# change_quantity  What changed: "Population" (07a) or "Detection\nprobability"
+#                  (07b); see prediction_scale_labels().
+make_min_supported_change_legend <- function(ci_level = 0.90,
+                                             change_quantity = "Population") {
+
   change_scale <- get_min_supported_change_scale()
-  
+
   legend_df <- tibble::tibble(
     level = change_scale$levels,
     label = change_scale$labels,
     y = seq_along(change_scale$levels)
   )
-  
+
   legend_title <- paste0(
-    "Population changed\nby at least this much\n(",
+    change_quantity, " changed\nby at least this much\n(",
     round(ci_level * 100),
     "% confident)"
   )
@@ -1427,6 +1518,7 @@ make_hex_abs_change_map <- function(species_name,
                                     water = NULL,
                                     water_fill = "#b8dceb",
                                     clip_boundaries = TRUE,   # FALSE: region_boundaries already clipped to region
+                                    change_quantity = "Population",   # legend wording; prediction_scale_labels()
                                     legend_inset = c(
                                       left = 0.8,
                                       bottom = 0.5,
@@ -1499,7 +1591,8 @@ make_hex_abs_change_map <- function(species_name,
     )
   }
   
-  legend_plot <- make_min_supported_change_legend(ci_level = map_confidence)
+  legend_plot <- make_min_supported_change_legend(ci_level        = map_confidence,
+                                                  change_quantity = change_quantity)
   
   chg_plot <- ggplot2::ggplot() +
     ggplot2::geom_sf(data = region, fill = "gray90")
@@ -1652,7 +1745,8 @@ assess_region <- function(region,
                           # rast / region_boundaries are ALREADY clipped to the
                           # region and carry `.hex_id`; no geometry is redone.
                           region_index            = NULL,
-                          hex_obs                 = NULL   # precomputed summarize_surveys_by_hex()
+                          hex_obs                 = NULL,  # precomputed summarize_surveys_by_hex()
+                          rast_legend_title       = "Relative abundance"   # prediction-map legend
                           ) {
   
   stopifnot(inherits(region, "sf"))
@@ -1740,7 +1834,8 @@ assess_region <- function(region,
     rast_min   = rast_min,
     transform  = transform,
     palette    = color_palette,
-    clipped    = prepared
+    clipped    = prepared,
+    legend_title = rast_legend_title
   )
   
   # Per-hexagon special-survey overlay (all-FALSE when special_dat is NULL).
@@ -2219,8 +2314,9 @@ plot_raster_gg <- function(rast,
                            rast_min   = NULL,
                            palette    = NULL,
                            transform  = "identity",
-                           clipped    = FALSE) {   # TRUE: rast already cropped/masked to study_area
-  
+                           clipped    = FALSE,     # TRUE: rast already cropped/masked to study_area
+                           legend_title = "Relative abundance") {   # prediction_scale_labels()$legend_title
+
   stopifnot(inherits(rast, "SpatRaster"))
   stopifnot(inherits(study_area, "sf"))
   
@@ -2303,7 +2399,7 @@ plot_raster_gg <- function(rast,
       oob      = scales::squish,
       na.value = "transparent",  # absent pixels show panel background through
       trans    = transform,
-      name     = "Relative abundance"
+      name     = legend_title
     ) +
     ggplot2::coord_sf() +
     ggplot2::theme_void() +
@@ -2731,7 +2827,8 @@ make_change_comparison_plot <- function(
       "Boreal Shield East",
       "Hudson Plains"),
     title = "Comparison of population change estimates",
-    subtitle = "Median and 90% credible intervals"
+    subtitle = "Median and 90% credible intervals",
+    x_label = "Estimated population change (%)"   # prediction_scale_labels()$change_axis_label
 ) {
   
   pct_to_logratio <- function(x) log1p(x / 100)
@@ -2872,7 +2969,7 @@ make_change_comparison_plot <- function(
       )
     ) +
     ggplot2::labs(
-      x = "Estimated population change (%)",
+      x = x_label,
       y = NULL,
       colour = "",
       title = title,
@@ -2992,7 +3089,7 @@ load_species_surveys <- function(dat_used, all_surveys) {
 # _surveys.R. Structured surveys have (approximately) fixed effort; checklist
 # surveys have variable effort and are OBBA3-only. Checklist surveys are present
 # in a species' reconstructed data ONLY when checklists were fit for it, i.e.
-# script 07 was run in a checklist mode (PC_ARU_CL or PC_ARU_CL_SS).
+# 07a/07b was run in a checklist mode (PC_ARU_CL or PC_ARU_CL_SS).
 honeycomb_structured_types <- c("Point_Count", "ARU")
 honeycomb_checklist_types  <- c("Breeding Bird Atlas", "Linear transect")
 
@@ -3028,12 +3125,16 @@ honeycomb_checklist_types  <- c("Breeding Bird Atlas", "Linear transect")
 #
 # Argument: sp_surveys  sf from load_species_surveys(); must carry Survey_Type,
 #   count, and Survey_Duration_Minutes.
+# Argument: per_minute  TRUE (default; 07a) divides by survey duration as above.
+#   FALSE (07b presence/absence, where count is already 0/1) keeps
+#   count_per_effort = count, so the per-hexagon mean is the observed PROPORTION
+#   of surveys with a detection -- the observed counterpart of a probability map.
 # Returns: list(
-#   data       = effort-type surveys with a count_per_effort column (count per minute),
+#   data       = effort-type surveys with a count_per_effort column,
 #   special    = special-survey rows (no effort; drawn as the overlay),
-#   per_minute = logical, always TRUE (count_per_effort is a per-minute rate)
+#   per_minute = logical, echoing the argument
 # )
-prepare_honeycomb_surveys <- function(sp_surveys) {
+prepare_honeycomb_surveys <- function(sp_surveys, per_minute = TRUE) {
   stopifnot(inherits(sp_surveys, "sf"))
   stopifnot(all(c("Survey_Type", "count") %in% names(sp_surveys)))
 
@@ -3043,7 +3144,7 @@ prepare_honeycomb_surveys <- function(sp_surveys) {
   keep_types <- c(honeycomb_structured_types, honeycomb_checklist_types)
 
   # Any remaining type is a special (targeted single-protocol) survey that the SS
-  # model kept -- script 07 leaves only ABOVE-threshold special rows in
+  # model kept -- 07a/07b leave only ABOVE-threshold special rows in
   # survey_counts, so no explicit special-type list is needed here. Special
   # surveys have NO effort covariate (Survey_Duration_Minutes is NA), so they are
   # split off and shown as a separate overlay (occurrence ring + detection x)
@@ -3053,6 +3154,12 @@ prepare_honeycomb_surveys <- function(sp_surveys) {
 
   out <- sp_surveys %>%
     dplyr::filter(Survey_Type %in% keep_types)
+
+  # Presence/absence (07b): the mean of the 0/1 response is a detection rate.
+  if (!isTRUE(per_minute)) {
+    out$count_per_effort <- out$count
+    return(list(data = out, special = special, per_minute = FALSE))
+  }
 
   if (!"Survey_Duration_Minutes" %in% names(out)) {
     stop("prepare_honeycomb_surveys(): Survey_Duration_Minutes is missing; ",
@@ -3073,12 +3180,14 @@ prepare_honeycomb_surveys <- function(sp_surveys) {
 }
 
 
-# Panel subtitle wording for the honeycomb circle-size legend. count_per_effort
-# from prepare_honeycomb_surveys() is always a per-minute rate; the per_minute
-# argument is retained so callers that size circles by raw counts elsewhere can
-# still request the plain-count wording.
-honeycomb_size_label <- function(per_minute = TRUE) {
-  if (isTRUE(per_minute)) {
+# Panel subtitle wording for the honeycomb circle-size legend, matching what
+# prepare_honeycomb_surveys() put in count_per_effort: a per-minute count rate
+# (07a), or, with detection_rate = TRUE, the proportion of surveys with a
+# detection (07b presence/absence).
+honeycomb_size_label <- function(per_minute = TRUE, detection_rate = FALSE) {
+  if (isTRUE(detection_rate)) {
+    "observed proportion of surveys with a detection in hexagon"
+  } else if (isTRUE(per_minute)) {
     "observed mean count per survey-minute in hexagon"
   } else {
     "observed mean count in hexagon"
@@ -3086,7 +3195,7 @@ honeycomb_size_label <- function(per_minute = TRUE) {
 }
 
 
-# Paired summaries produced by 07b must be keyed on BCR. If a file keyed on
+# Paired summaries produced by 07c must be keyed on BCR. If a file keyed on
 # Biol_Region is found, fail loudly rather than silently mis-joining: the
 # posterior change summaries are computed per region upstream and cannot be
 # retro-fitted spatially here.
@@ -3099,7 +3208,7 @@ require_bcr_key <- function(x, what, sp_english) {
     stop(
       "Paired summary '", what, "' for ", sp_english, " is keyed on ",
       "Biol_Region (atlas biological regions). Rerun ",
-      "07b_fit_models_to_shared_footprint.R with BCR regions so that the ",
+      "07c_fit_models_to_shared_footprint.R with BCR regions so that the ",
       "shared change summaries are computed per BCR.",
       call. = FALSE
     )
@@ -3143,8 +3252,9 @@ build_period_assessments <- function(region_geom,
                                      count_size_label = "observed mean count in hexagon",
                                      A2_special = NULL,
                                      A3_special = NULL,
-                                     region_index = NULL) {
-  
+                                     region_index = NULL,
+                                     rast_legend_title = "Relative abundance") {
+
   prepared <- !is.null(region_index)
   
   if (prepared) {
@@ -3230,7 +3340,8 @@ build_period_assessments <- function(region_geom,
       count_size_label     = count_size_label,
       special_dat          = special,
       region_index         = region_index,
-      hex_obs              = hex_obs
+      hex_obs              = hex_obs,
+      rast_legend_title    = rast_legend_title
     )
   }
   

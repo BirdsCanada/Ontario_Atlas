@@ -9,10 +9,10 @@
 #   1. Survey metadata        infer_survey_type_OBBA3_PC, infer_survey_type_OBBA3_CL,
 #                             make_datetime_from_frac_hours, make_survey_id   (02)
 #   2. Count tables           build_count_matrix (02), as_counts_tbl (06)
-#   3. Site identifiers       add_site_ids (07)
+#   3. Site identifiers       add_site_ids (07a, 07b)
 #   4. Spatial aggregation    build_pixel_polygon_index (06)
 #
-# Sourced by 02, 06 and 07.
+# Sourced by 02, 06, 07a and 07b.
 # ============================================================
 
 # ============================================================

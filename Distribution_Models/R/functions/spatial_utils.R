@@ -35,7 +35,7 @@ get_aea_km_crs <- function() {
 #               for the study CRS). hex_id is assigned BEFORE non-intersecting
 #               hexagons are dropped, so ids are not contiguous. 06 uses this
 #               for the 25-km aggregation grid; that hex_id is carried into every
-#               prediction file (07) and region summary (08), so keep it stable.
+#               prediction file (07a/07b) and region summary (08), so keep it stable.
 #   n_hexagons  Target number of hexagons intersecting the study area. The area
 #               is validated and unioned first (projected to EPSG:3978 if it is
 #               geographic, then returned in the input CRS), and hex_id is

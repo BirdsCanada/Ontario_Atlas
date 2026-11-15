@@ -1,5 +1,5 @@
 # ============================================================
-# 07_fit_models_and_predict.R
+# 07a_fit_models_and_predict.R
 #
 # Fit joint OBBA2/OBBA3 INLA/inlabru models for selected species and generate
 # prediction products on the full 1-km grids. The `survey_set` switch selects a
@@ -30,6 +30,16 @@
 # squares/sites. An optional lognormal variance correction (vc_* below, off by
 # default) rescales to the arithmetic mean. Predictions are standardized to
 # optimal_TOD and days_midpoint = 0 -- a standardized index.
+#
+# Prediction survey type: by default a 5-min point count. A species far more
+# detectable on a special survey is predicted for THAT protocol instead (see
+# choose_prediction_survey() and the pred_survey_* settings below). The choice
+# is saved as prediction_survey_type in the summaries and prediction files, so
+# figures can label the scale correctly.
+#
+# Companion scripts: 07b_fit_PA_models_and_predict.R fits the same models to
+# presence/absence data (probability of detection); 07c_fit_models_to_shared_
+# footprint.R is the paired point-count change analysis used as a sanity check.
 #
 # Outputs (model_output/):
 #   predictions_<model_name>/<species>_1km.rds
@@ -73,7 +83,32 @@ prediction_seed    <- 0
 
 # Optional: restrict to a subset for testing, e.g. c("Redhead", "Ruddy Duck")
 # (NULL = run all).
-species_test <- NULL
+species_test <- species_test <- c("Palm Warbler","Eastern Screech-Owl",
+                                  "Eastern Whip-poor-will","Common Nighthawk",
+                                  "Great Gray Owl","Boreal Owl",
+                                  "Great Blue Heron","Least Bittern",
+                                  "Sora","Olive-sided Flycatcher",
+                                  "Canada Goose","Red-winged Blackbird")
+
+# ---- Survey type used for prediction (see choose_prediction_survey()) ----
+# Only matters in modes with special surveys (fit_PC_ARU_CL with
+# special_survey_types); everything else predicts for 5-min point counts.
+#
+# 1. A priori overrides, sp_english -> Survey_Type. They take precedence over
+#    the rule. "Point_Count" forces the default. Names must match Survey_Type
+#    exactly as it appears in all_surveys.
+pred_survey_overrides <- c(
+  # "Great Gray Owl" = "Northern Ontario Owl Survey"
+)
+
+# 2. Data-driven rule, applied when no override applies. A special type is used
+#    if, at a fixed location, it is at least pred_survey_min_ratio times as
+#    detectable as a point count (posterior median) AND more detectable with
+#    posterior probability >= pred_survey_min_prob. Set
+#    pred_survey_auto <- FALSE to use only the overrides.
+pred_survey_auto      <- TRUE
+pred_survey_min_ratio <- 2
+pred_survey_min_prob  <- 0.95
 
 
 # Modes (survey types, fit function, structural switches, special-survey
@@ -89,6 +124,11 @@ message("Mode: ", survey_set, "  ->  model_name = ", model_name)
 # ============================================================
 # 1. Global configuration
 # ============================================================
+
+# What the predicted surfaces are. Saved in every prediction file and summary
+# so 08 and 09 label and process the outputs correctly (07b writes
+# "probability").
+response_scale <- "expected_count"   # mu = exp(eta)
 
 # Negative-binomial gate (see choose_stream_family()), applied to each species'
 # pooled counts. A species is fit as nbinomial only when it has >=
@@ -431,7 +471,8 @@ for (i in seq_len(nrow(species_all))) {
       sp_det_summary = sp_det_summary,
       sp_special_summary = sp_special_summary,
       special_report = special_report,     # per-type n_det_squares / threshold / kept
-      error_family  = error_family
+      error_family  = error_family,
+      response_scale = response_scale      # read by 09 for honeycomb-only species
     ),
     dat_path
   )
@@ -646,7 +687,33 @@ for (i in seq_len(nrow(species_all))) {
   message("  reference hour = ", round(optimal_TOD, 2),
           " (", optimal_TOD_src, "; empirical peak was ",
           round(optimal_TOD_empirical, 2), ")")
-  
+
+  # ---- 6.7d Survey type used for prediction ----
+  # Point count by default; a special protocol when an a priori override names
+  # it, or when the fitted contrast shows it is much more detectable at a fixed
+  # location (choose_prediction_survey()). The prediction grid is built here
+  # because one of its rows is the template for the contrast draws.
+  pred_grid <- make_pred_grid(grid_OBBA2, grid_OBBA3)
+
+  prediction_survey <- choose_prediction_survey(
+    mod          = mod,
+    sp_english   = sp_name,
+    template_row = pred_grid[1, ],
+    optimal_TOD  = optimal_TOD,
+    overrides    = pred_survey_overrides,
+    auto         = pred_survey_auto,
+    min_ratio    = pred_survey_min_ratio,
+    min_prob     = pred_survey_min_prob,
+    n_draws      = n_prediction_draws,
+    seed         = prediction_seed
+  )
+
+  if (!is.null(prediction_survey$contrasts)) {
+    print(prediction_survey$contrasts)
+  }
+  message("  prediction survey = ", prediction_survey$survey_type,
+          " (", prediction_survey$source, ")")
+
   model_summaries[[sp_name]] <- list(
     sp_name          = sp_name,
     sp_code          = sp_code,
@@ -671,6 +738,11 @@ for (i in seq_len(nrow(species_all))) {
     optimal_TOD_fitted    = optimal_TOD_fitted,
     optimal_TOD_source    = optimal_TOD_src,
     hours_supported       = hours_supported,
+
+    response_scale         = response_scale,   # expected_count or probability
+    prediction_survey_type = prediction_survey$survey_type,   # scale of the maps
+    prediction_survey      = prediction_survey,   # full record, incl. contrasts
+
     tod_fixed_range       = mod$tod_fixed_range,
     tod_knot_gap          = mod$tod_knot_gap,
     fit_minutes           = fit_minutes,
@@ -680,16 +752,25 @@ for (i in seq_len(nrow(species_all))) {
   save_atomic(model_summaries, model_summaries_path)
   
   # ---- 6.8 Full-grid predictions ----
-  # Standardized to optimal_TOD, days_midpoint = 0, with kappa_diff and site_iid
+  # Standardized to the prediction survey chosen in 6.7d (point count: at
+  # optimal_TOD; special survey: its own intercept, at its own typical hour if
+  # it shares the TOD smooth), days_midpoint = 0, with kappa_diff and site_iid
   # omitted from pred_formula -> exp(eta) is a geometric mean (6.9 optionally
   # rescales to the arithmetic mean).
   start_prediction <- Sys.time()
-  message("Generating predictions for full 1-km grid")
-  
-  pred_formula <- make_pred_formula_multiatlas(cov_df_sp)
-  
-  pred_grid <- make_pred_grid(grid_OBBA2, grid_OBBA3) %>%
-    mutate(Hours_After_Reference = optimal_TOD, days_midpoint = 0)
+  message("Generating predictions for full 1-km grid (",
+          prediction_survey$survey_type, " scale)")
+
+  pred_formula <- make_pred_formula_multiatlas(
+    cov_df         = cov_df_sp,
+    special_effect = prediction_survey$effect_name,
+    include_TOD    = prediction_survey$include_TOD,
+    include_DOY    = prediction_survey$include_DOY
+  )
+
+  pred_grid <- pred_grid %>%
+    mutate(Hours_After_Reference = prediction_survey$Hours_After_Reference,
+           days_midpoint         = prediction_survey$days_midpoint)
   
   preds <- predict_all_pixels(
     mod = mod, pred_grid = pred_grid, pred_formula = pred_formula,
@@ -797,7 +878,10 @@ for (i in seq_len(nrow(species_all))) {
       summary_hyperpar = mod$summary.hyperpar,
       
       pred_doy           = pred_doy,
-      optimal_TOD        = optimal_TOD,
+      optimal_TOD        = optimal_TOD,   # point-count reference hour
+      response_scale         = response_scale,   # expected_count or probability
+      prediction_survey_type = prediction_survey$survey_type,   # scale of the maps
+      prediction_survey      = prediction_survey,
       prediction_seed    = prediction_seed,
       n_prediction_draws = n_prediction_draws,
       
@@ -827,4 +911,4 @@ for (i in seq_len(nrow(species_all))) {
   gc(verbose = FALSE)
 }
 
-message("\n07_fit_models_and_predict.R complete  (mode: ", survey_set, ").")
+message("\n07a_fit_models_and_predict.R complete  (mode: ", survey_set, ").")

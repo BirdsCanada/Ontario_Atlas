@@ -1,0 +1,920 @@
+# ============================================================
+# 07b_fit_PA_models_and_predict.R
+#
+# PRESENCE/ABSENCE version of 07a_fit_models_and_predict.R. Same modes, data,
+# meshes, priors, model structure and outputs as 07a, but every survey is reduced
+# to detected (1) / not detected (0) and fitted as Bernoulli with a cloglog
+# link. The predicted surface is the PROBABILITY OF DETECTING the species on one
+# survey of the prediction protocol (see "Prediction survey type" below).
+#
+# Why cloglog: if counts were Poisson(lambda), P(y > 0) = 1 - exp(-lambda), so
+# cloglog(p) = log(lambda). The linear predictor therefore stays log detection
+# intensity, and every component (abundance/change fields, ARU contrasts, effort
+# slopes, special-survey intercepts) and every prior keeps its 07a meaning.
+#
+# Differences from 07a (search for "PA:" to find each one):
+#   - model_name gets a "_PA" suffix, so outputs never overwrite 07a's.
+#   - count is reduced to 0/1 after the special-survey row selection (6.2c);
+#     the original count is kept as count_raw for summaries.
+#   - error family is always "binomial" (no NB gate, no fallback).
+#   - predictions are probabilities (1 - exp(-exp(eta))).
+#   - the lognormal variance correction is replaced by Gauss-Hermite
+#     integration over the omitted iid variance (marginalize_cloglog_iid()).
+#   - the open-water correction thins detection intensity, not probability:
+#     p_land = 1 - (1 - p)^(1 - open_water).
+#
+# Sample size: identical to 07a (modelability already uses count > 0).
+#
+# Modes differ only in:
+#   model_name    -> output folder names
+#   survey_types  -> which survey types are kept per species
+#   fit_function  -> fit_PC_ARU()    (point counts + ARUs; site + square iid)
+#                    fit_PC_ARU_CL() (adds BBA + linear-transect checklists
+#                                     and/or special-survey intercepts)
+#   special_*     -> special-survey types, thresholds and smooth sharing (SS modes)
+#   include_site / include_square -> the two structural iid switches (independent)
+#
+# Sample size: a species is fit iff it is detected in >= MIN_SQUARES_PER_ATLAS
+# squares within at least one atlas, counted on the rows this mode fits
+# (assess_modelability()). 06 writes the same decision for every mode to
+# species_modelability; counts in no-safe-date regions are already zeroed by 06.
+#
+# Modes differ only in:
+#   model_name    -> output folder names
+#   survey_types  -> which survey types are kept per species
+#   fit_function  -> fit_PC_ARU()    (point counts + ARUs; site + square iid)
+#                    fit_PC_ARU_CL() (adds BBA + linear-transect checklists
+#                                     and/or special-survey intercepts)
+#   special_*     -> special-survey types, thresholds and smooth sharing (SS modes)
+#   include_site / include_square -> the two structural iid switches (independent)
+#
+# Prediction scale: the prediction formula omits the iid terms (kappa_diff,
+# site_iid; both fitted constr = TRUE), so by default the mapped probability is
+# for the MEDIAN square/site. Setting vc_terms (6.9) integrates over those terms
+# instead, giving the probability averaged over squares/sites. Predictions are
+# standardized to the prediction survey's hour and days_midpoint = 0 -- a
+# standardized index.
+#
+# Prediction survey type: by default a 5-min point count. A species far more
+# detectable on a special survey is predicted for THAT protocol instead (see
+# choose_prediction_survey() and the pred_survey_* settings below). The choice
+# is saved as prediction_survey_type in the summaries and prediction files, so
+# figures can label the scale correctly.
+#
+# Outputs (model_output/):
+#   predictions_<model_name>/<species>_1km.rds
+#   summaries_<model_name>/model_summaries.rds
+#   data_used_<model_name>/<species>_1km.rds
+# ============================================================
+
+rm(list = ls())
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(stringr)
+  library(purrr)
+  library(sf)
+  library(INLA)
+  library(inlabru)
+  library(fmesher)
+  library(here)
+  library(ggplot2)
+})
+
+source(here::here("R", "00_config_paths.R"))
+source(here::here("R", "00_model_modes.R"))   # mode_settings, MIN_SQUARES_PER_ATLAS
+source(file.path(paths$functions, "inla_model_utils.R"))
+source(file.path(paths$functions, "survey_processing_utils.R"))   # add_site_ids()
+
+# ============================================================
+# Choose which model to run (normally the only lines you edit)
+# ============================================================
+
+survey_set         <- "PC_ARU_CL_SS"
+
+# ============================================================
+# Additional settings that could be modified
+# ============================================================
+
+rerun_predictions  <- FALSE
+n_prediction_draws <- 500
+prediction_seed    <- 0
+
+# Optional: restrict to a subset for testing, e.g. c("Redhead", "Ruddy Duck")
+# (NULL = run all).
+species_test <- c("Palm Warbler","Eastern Screech-Owl",
+                  "Eastern Whip-poor-will","Common Nighthawk",
+                  "Great Gray Owl","Boreal Owl",
+                  "Great Blue Heron","Least Bittern",
+                  "Sora","Olive-sided Flycatcher",
+                  "Canada Goose","Red-winged Blackbird")
+
+
+# ---- Survey type used for prediction (see choose_prediction_survey()) ----
+# Only matters in modes with special surveys (fit_PC_ARU_CL with
+# special_survey_types); everything else predicts for 5-min point counts.
+#
+# 1. A priori overrides, sp_english -> Survey_Type. They take precedence over
+#    the rule. "Point_Count" forces the default. Names must match Survey_Type
+#    exactly as it appears in all_surveys.
+pred_survey_overrides <- c(
+  # "Great Gray Owl" = "Northern Ontario Owl Survey"
+)
+
+# 2. Data-driven rule, applied when no override applies. A special type is used
+#    if, at a fixed location, it is at least pred_survey_min_ratio times as
+#    detectable as a point count (posterior median) AND more detectable with
+#    posterior probability >= pred_survey_min_prob. Set
+#    pred_survey_auto <- FALSE to use only the overrides.
+pred_survey_auto      <- TRUE
+pred_survey_min_ratio <- 2
+pred_survey_min_prob  <- 0.95
+
+
+# Modes (survey types, fit function, structural switches, special-survey
+# settings) and the modelability threshold are defined in R/00_model_modes.R.
+
+stopifnot(survey_set %in% names(mode_settings))
+mode       <- mode_settings[[survey_set]]
+model_name <- paste0(mode$model_name, "_PA")   # PA: separate output folders
+fit_model  <- match.fun(mode$fit_function)
+
+message("Mode: ", survey_set, "  ->  model_name = ", model_name)
+
+# ============================================================
+# 1. Global configuration
+# ============================================================
+
+# PA: one observation model for every species -- Bernoulli with a cloglog link
+# (no negative-binomial gate; Bernoulli data carry no overdispersion to model).
+error_family <- "binomial"
+link         <- "cloglog"
+
+# What the predicted surfaces are. Saved in every prediction file and summary
+# so 08 and 09 label and process the outputs correctly (07a writes
+# "expected_count").
+response_scale <- "probability"   # mu = 1 - exp(-exp(eta))
+
+# PA: Gauss-Hermite nodes for integrating over omitted iid variance (6.9).
+n_gauss_hermite_nodes <- 20
+
+# Candidate fixed-effect covariates. Species-specific filtering below drops any
+# absent from the data or with no variation after filtering.
+base_covars <- c(
+  
+  "ForestNeedleleaf", "ForestBroadleaf", "ForestMixed", "Cropland",
+  "Urban", "On_Road",
+  "Lake_Lg", "Lake_Sm", "GreatLakes", "HudsonBayCoast", "River_Lg", "River_Sm",
+  
+  # Modeled with separate north/south effects.
+  "Grassland_South", "Grassland_North",
+  "Shrubland_South", "Shrubland_North",
+  "Wetland_South",   "Wetland_North"
+)
+
+priors_list <- list(
+  # Large-scale abundance & change fields (SPDE, PC-Matern). 
+  # Range prior favours long (300-1000 km) ranges
+  prior_range_abund  = c(300, 0.1),   # P(range < 300 km) = 0.1
+  prior_sigma_abund  = c(1, 0.1),     # P(sigma > 1)    = 0.1
+  prior_range_change = c(300, 0.1),   # P(range < 300 km) = 0.1
+  prior_sigma_change = c(0.3, 0.1),   # P(sigma > 0.3)    = 0.1
+  
+  # iid sinks: atlas-square (~10 km) and site (repeated visits).
+  kappa_pcprec_diff  = c(1, 0.1),     # P(sigma_square > 1) = 0.1
+  prior_site_pcprec  = c(1, 0.1),     # P(sigma_site  > 1) = 0.1
+  
+  # Time-of-day smooth: FIXED range + estimated sigma.
+  fixed_TOD_range = 4.5,
+  prior_TOD_sigma = c(1, 0.1),        # P(sigma > 1) = 0.1 
+  
+  # Day-of-year smooth: FIXED range + estimated sigma.
+  fixed_DOY_range = 30,
+  prior_DOY_sigma = c(1, 0.1),        # P(sigma > 1) = 0.1
+  
+  # Checklist effort slopes on log(effort / median effort). A single log-linear
+  # coefficient per protocol (BBA duration, LT distance), NOT a 1-D SPDE. Prior
+  # mean > 0 favours more detections with more effort (diminishing returns).
+  BBA_log_duration_prior_mean = 0.30,
+  BBA_log_duration_prior_sd   = 0.20,
+  LT_log_distance_prior_mean  = 0.30,
+  LT_log_distance_prior_sd    = 0.20
+)
+
+# INLA approximation settings used inside the fit function.
+int_strategy <- "ccd"
+strategy     <- "simplified.laplace"
+
+# ============================================================
+# 2. Input/output locations
+# ============================================================
+
+in_file     <- file.path(paths$data_clean, "birds", "data_ready_for_analysis.rds")
+species_dir <- file.path(paths$data_clean, "birds", "species_data")   # written by 06
+
+if (!file.exists(in_file)) {
+  stop("Cannot find input at: ", in_file,
+       "\nHave you run 06_filter_and_finalize_surveys.R?")
+}
+
+out_dir       <- paths$model_output
+pred_dir      <- file.path(out_dir, paste0("predictions_", model_name))
+summary_dir   <- file.path(out_dir, paste0("summaries_", model_name))
+data_used_dir <- file.path(out_dir, paste0("data_used_", model_name))
+
+purrr::walk(c(out_dir, pred_dir, summary_dir, data_used_dir),
+            dir.create, recursive = TRUE, showWarnings = FALSE)
+
+model_summaries_path <- file.path(summary_dir, "model_summaries.rds")
+model_summaries      <- load_or_empty_list(model_summaries_path)
+
+# ============================================================
+# 3. Load finalized data
+# ============================================================
+
+dat <- readRDS(in_file)
+
+all_surveys                 <- dat$all_surveys
+grid_OBBA2                  <- dat$grid_OBBA2
+grid_OBBA3                  <- dat$grid_OBBA3
+study_boundary              <- dat$study_boundary %>% sf::st_as_sf()
+species_detection_summaries <- dat$species_detection_summaries
+species_modelability        <- dat$species_modelability   # species x mode x atlas (06)
+
+if (is.null(species_modelability)) {
+  stop("species_modelability missing from ", in_file,
+       "\nRerun 06_filter_and_finalize_surveys.R.")
+}
+if (!identical(dat$min_squares_per_atlas, MIN_SQUARES_PER_ATLAS)) {
+  warning("MIN_SQUARES_PER_ATLAS (", MIN_SQUARES_PER_ATLAS, ") differs from the value ",
+          "06 used (", dat$min_squares_per_atlas, "); rerun 06 to refresh ",
+          "species_modelability.", call. = FALSE)
+}
+
+if (!dir.exists(species_dir)) {
+  stop("Per-species data directory not found: ", species_dir,
+       "\nRerun 06_filter_and_finalize_surveys.R.")
+}
+
+# ============================================================
+# 4. List of species to consider
+# ============================================================
+
+species_all <- species_detection_summaries %>%
+  dplyr::select(sp_english, species_id) %>%
+  distinct()
+
+# Apply the test filter when supplied (NULL means "all").
+if (!is.null(species_test)) {
+  species_all <- species_all %>% filter(sp_english %in% species_test)
+}
+
+message("Species in list: ", nrow(species_all))
+
+# ============================================================
+# 5. Build spatial meshes once
+# ============================================================
+
+bndry <- study_boundary %>%
+  st_make_valid() %>%
+  st_cast("POLYGON", warn = FALSE) %>%
+  mutate(area_km2 = as.numeric(st_area(geometry))) %>%
+  filter(area_km2 >= 25) %>%
+  summarise(geometry = st_union(geometry)) %>%
+  st_simplify(dTolerance = 10, preserveTopology = TRUE)
+
+hull <- fmesher::fm_extensions(bndry, convex = c(50, 600), concave = c(50, 600))
+
+mesh_abund <- fmesher::fm_mesh_2d_inla(
+  loc = sf::st_as_sfc(all_surveys), boundary = hull,
+  max.edge = c(30, 150), cutoff = 30, crs = sf::st_crs(all_surveys)
+)
+
+mesh_chg <- fmesher::fm_mesh_2d_inla(
+  loc = sf::st_as_sfc(all_surveys), boundary = hull,
+  max.edge = c(30, 150), cutoff = 30, crs = sf::st_crs(all_surveys)
+)
+
+# ---- 1-D time-of-day mesh ----
+# Built ONCE so every species shares one basis and the fixed range means the same
+# thing for all of them. Knot spacing must be <= fixed_TOD_range / 5 or the basis
+# (not the range) sets smoothness. Domain is cyclic (Hours_After_Reference is
+# measured from 3 h before sunrise).
+TOD_knot_spacing <- priors_list$fixed_TOD_range / 6
+mesh_TOD <- make_TOD_mesh(span = c(0, 24), knot_spacing = TOD_knot_spacing,
+                          pad_range = priors_list$fixed_TOD_range)
+
+message("TOD mesh: ", length(mesh_TOD$loc), " knots at ",
+        signif(TOD_knot_spacing, 3), " h spacing; range fixed at ",
+        priors_list$fixed_TOD_range, " h")
+
+# Survey coverage by hour and protocol (informs the reference-hour logic in 6.6).
+TOD_coverage <- all_surveys %>%
+  sf::st_drop_geometry() %>%
+  dplyr::mutate(hour = floor(Hours_After_Reference)) %>%
+  dplyr::count(hour, Survey_Type) %>%
+  tidyr::pivot_wider(names_from = Survey_Type, values_from = n, values_fill = 0)
+print(TOD_coverage, n = 25)
+
+# ============================================================
+# 6. Main species loop
+# ============================================================
+
+for (i in seq_len(nrow(species_all))) {
+  
+  # ---- 6.1 Identifiers, paths, modelability ----
+  sp_name <- species_all$sp_english[i]
+  sp_code <- as.character(species_all$species_id[i])
+  sp_file <- sp_filename(sp_name)
+  
+  message("\n====================\n",
+          i, "/", nrow(species_all), ": ", sp_name,
+          " (species_id = ", sp_code, ")\n====================")
+  
+  pred_path <- file.path(pred_dir, paste0(sp_file, "_1km.rds"))
+  
+  if (file.exists(pred_path) && !rerun_predictions) {
+    message("Predictions already exist for ", sp_name, "; skipping model fit.")
+    next
+  }
+  
+  dat_path <- file.path(data_used_dir, paste0(sp_file, "_1km.rds"))
+  sp_path  <- sp_data_path(species_dir, sp_name)
+  
+  if (!file.exists(sp_path)) {
+    message("Skipping; no per-species data file from script 06.")
+    next
+  }
+  
+  # ---- 6.2 Load species data (safe-date filtering + pred_doy from 06) ----
+  sp <- load_sp_dat(sp_path, all_surveys,
+                    survey_types = mode$survey_types,
+                    survey_durations = mode$survey_durations)
+  
+  # Records must carry counts already zeroed in no-safe-date regions (06).
+  if (!isTRUE(sp$nonsafe_zeroed)) {
+    stop(sp_name, ": per-species record predates non-safe-region zeroing; ",
+         "rerun 06 with rebuild_species_data = TRUE.")
+  }
+  
+  sp_dat        <- sp$sp_dat
+  sp_safe_dates <- sp$sp_safe_dates_unmodified
+  pred_doy      <- sp$pred_doy
+  
+  if (nrow(sp_dat) == 0) {
+    message("Skipping ", sp_name, "; no surveys of the required types remain.")
+    next
+  }
+  
+  n_det <- sum(sp_dat$count > 0)
+  if (n_det == 0) {
+    message("Skipping ", sp_name, "; no positive counts remain after filtering.")
+    next
+  }
+  
+  # ---- 6.2b Restrict to the special surveys actually analysed ----
+  # load_sp_dat() returns every type in mode$survey_types, but fit_PC_ARU_CL()
+  # keeps a special type's intercept only where the species is detected in >= its
+  # square threshold and DROPS all rows of the types below it (fit section 3a).
+  # Mirror that here on the SAME resolver so sp_dat holds only the rows the model
+  # will see BEFORE it feeds the family choice, sp_det_summary, is_modelable, the
+  # saved survey_counts and the fit -- otherwise the dat_path record (used by the
+  # downstream "analysed data" plots) overstates the data. Inert for non-SS
+  # modes. With SS_SKIP_IF_NO_SPECIAL = TRUE (R/00_model_modes.R), species with
+  # no qualifying special type are skipped here and no data record is written;
+  # 06's species_modelability$will_fit applies the same rule.
+  
+  sel <- select_mode_rows(
+    sp_dat               = sp_dat,
+    special_survey_types = mode$special_survey_types,
+    min_special_squares  = mode$min_special_squares
+  )
+  
+  special_report <- sel$special_report
+  
+  if (!sel$special_ok && SS_SKIP_IF_NO_SPECIAL) {
+    message("Skipping ", sp_name, "; no special survey meets its square ",
+            "threshold (mode ", survey_set, "; SS_SKIP_IF_NO_SPECIAL = TRUE).")
+    next
+  }
+  
+  if (length(sel$special_drop) > 0) {
+    message("  dropping below-threshold special rows: ",
+            paste(sel$special_drop, collapse = ", "))
+    sp_dat <- sel$sp_dat
+    n_det  <- sum(sp_dat$count > 0)   # recompute on the analysed row set
+  }
+  
+  
+  # ---- 6.2c PA: reduce counts to detected / not detected ----
+  # Done after the special-survey row selection, which (like modelability)
+  # depends only on count > 0 and so is unaffected. count_raw keeps the original
+  # counts for the saved records and the square summary (6.12).
+  sp_dat$count_raw <- sp_dat$count
+  sp_dat$count     <- as.numeric(sp_dat$count > 0)
+
+  # ---- 6.3 PA: error family is fixed (binomial, cloglog; see section 1) ----
+
+  # ---- Sample-size gate ----
+  # Modelable iff detected in >= MIN_SQUARES_PER_ATLAS squares within at least
+  # one atlas, on exactly the rows this mode fits (no detection-count threshold).
+  ma                 <- assess_modelability(sp_dat = sp_dat, min_squares = MIN_SQUARES_PER_ATLAS)
+  sp_det_summary     <- ma$by_atlas
+  is_modelable       <- ma$is_modelable
+  qualifying_atlases <- ma$qualifying_atlases
+  
+  # Cross-check against the table 06 built with the same helpers.
+  modelable_06 <- unique(species_modelability$is_modelable[
+    species_modelability$mode == survey_set & species_modelability$sp_english == sp_name
+  ])
+  if (length(modelable_06) == 1 && !identical(modelable_06, is_modelable)) {
+    warning(sp_name, ": modelability here (", is_modelable, ") disagrees with ",
+            "06's species_modelability (", modelable_06, "). Rerun 06.", call. = FALSE)
+  }
+  
+  # Special-survey detection squares (pooled across atlases), to audit / tune the
+  # per-type min_special_squares thresholds. Matches the count fit_PC_ARU_CL()
+  # thresholds on: unique square_id with count > 0 for each special type. Empty
+  # for modes that don't load the special surveys.
+  sp_special_summary <- sp_dat %>%
+    st_drop_geometry() %>%
+    filter(Survey_Type %in% MODEL_SPECIAL_SURVEY_TYPES, count > 0) %>%
+    group_by(Survey_Type) %>%
+    summarize(n_det_squares = n_distinct(square_id),
+              n_detections  = n(),
+              .groups       = "drop")
+  
+  # Special-survey keep/drop is resolved in 6.2b; below-threshold rows (and any
+  # species that qualifies for no special type) are already handled there.
+  
+  # Site-level REs: one site = one location (snapped to a 500-m grid) within an
+  # atlas, pooling all years of that atlas. Sites are never shared between
+  # atlases. add_site_ids() also returns site_year_id, which the fit does not use.
+  sp_dat <- add_site_ids(sp_dat, snap_m = 500, tolerance_m = 0)
+  
+  # (Counts in no-safe-date regions are zeroed upstream in 06.)
+  
+  # ---- 6.4 Save data record for every species ----
+  save_atomic(
+    list(
+      sp_english    = sp_name,
+      sp_code       = sp_code,
+      is_modelable  = is_modelable,
+      qualifying_atlases    = qualifying_atlases,      # atlases with >= min squares
+      min_squares_per_atlas = MIN_SQUARES_PER_ATLAS,
+      sp_safe_dates = sp_safe_dates,
+      pred_doy      = pred_doy,
+      # PA: count is the 0/1 response the model sees; count_raw the original.
+      survey_counts = sp_dat %>% st_drop_geometry() %>% select(survey_id, count, count_raw, site_id),
+      sp_det_summary = sp_det_summary,
+      sp_special_summary = sp_special_summary,
+      special_report = special_report,     # per-type n_det_squares / threshold / kept
+      error_family  = error_family,
+      link          = link,
+      response_scale = response_scale      # read by 09 for honeycomb-only species
+    ),
+    dat_path
+  )
+  
+  if (!is_modelable) {
+    message("Honeycomb data saved for ", sp_name, "; not enough data to fit a model.")
+    next
+  }
+  
+  # ---- 6.5 Species-specific covariate table ----
+  # Keep candidate covariates present in this species' data with > 1 unique finite
+  # value after filtering. sd_linear kept tight (0.5): loose habitat betas on
+  # sparse 0/1 detections drive checkerboard artefacts in the abundance maps.
+  covars_present <- intersect(base_covars, names(sp_dat))
+  if (length(covars_present) > 0) {
+    covars_present <- sp_dat %>%
+      sf::st_drop_geometry() %>%
+      select(all_of(covars_present)) %>%
+      summarise(across(everything(),
+                       ~ dplyr::n_distinct(.x[is.finite(.x)], na.rm = TRUE))) %>%
+      tidyr::pivot_longer(everything(), names_to = "covariate", values_to = "n_unique") %>%
+      filter(n_unique > 1) %>%
+      pull(covariate)
+  }
+  cov_df_sp <- make_cov_df(covars_present, mean = 0, sd_linear = 0.5)
+  
+  # ---- 6.6 Candidate reference hours + empirical starting value ----
+  obs_dat <- sp_dat %>%
+    st_drop_geometry() %>%
+    filter(Survey_Type %in% c("Point_Count", "ARU")) %>%
+    mutate(hour = round(Hours_After_Reference)) %>%
+    group_by(hour, site_id) %>%
+    summarize(mean_count = mean(count > 0), n = n(), .groups = "drop") %>%
+    group_by(hour) %>%
+    summarize(mean_count = mean(mean_count), n = n(), .groups = "drop") %>%
+    filter(n > 1000)
+  
+  hours_supported <- obs_dat$hour
+  
+  if (nrow(obs_dat) == 0) {
+    message("  too few PC/ARU surveys to set a reference hour; defaulting to 3 (sunrise)")
+    optimal_TOD_empirical <- 3
+    hours_supported       <- 3
+  } else {
+    optimal_TOD_empirical <- obs_dat$hour[which.max(obs_dat$mean_count)]
+    plot(mean_count ~ hour, data = obs_dat, type = "p", pch = 19, lwd = 2,
+         main = paste0(sp_name, " - detection rate by time of day\n\nEmpirical peak = ",
+                       round(optimal_TOD_empirical, 2), " hours since reference"))
+    abline(v = optimal_TOD_empirical, col = "dodgerblue", lwd = 2)
+    abline(v = 3, col = "gray80", lwd = 2, lty = 2)
+  }
+  
+  # ---- 1-D day-of-year mesh (linear domain, per species) ----
+  DOY_range        <- range(sp_dat$days_midpoint)
+  DOY_knot_spacing <- priors_list$fixed_DOY_range / 6
+  mesh_DOY <- make_DOY_mesh(span = c(DOY_range[1] - 7, DOY_range[2] + 7),
+                            knot_spacing = DOY_knot_spacing,
+                            pad_range = priors_list$fixed_DOY_range)
+  message("DOY mesh: ", length(mesh_DOY$loc), " knots at ",
+          signif(DOY_knot_spacing, 3), " d spacing; range fixed at ",
+          priors_list$fixed_DOY_range, " d")
+  
+  # ---- 6.7 Fit model ----
+  start_model <- Sys.time()
+  
+  # Shared arguments. PA: family is always binomial (cloglog link).
+  fit_args <- list(
+    family     = error_family,
+    sp_dat     = sp_dat,
+    mesh_abund = mesh_abund,
+    mesh_chg   = mesh_chg,
+    mesh_TOD   = mesh_TOD,
+    covariates = cov_df_sp,
+    
+    prior_range_abund  = priors_list$prior_range_abund,
+    prior_sigma_abund  = priors_list$prior_sigma_abund,
+    prior_range_change = priors_list$prior_range_change,
+    prior_sigma_change = priors_list$prior_sigma_change,
+    
+    fixed_TOD_range = priors_list$fixed_TOD_range,
+    prior_TOD_sigma = priors_list$prior_TOD_sigma,
+    
+    mesh_DOY        = mesh_DOY,
+    fixed_DOY_range = priors_list$fixed_DOY_range,
+    prior_DOY_sigma = priors_list$prior_DOY_sigma,
+    
+    kappa_pcprec_diff = priors_list$kappa_pcprec_diff,
+    prior_site_pcprec = priors_list$prior_site_pcprec,
+    
+    int_strategy = int_strategy,
+    strategy     = strategy,
+    
+    include_site   = mode$include_site,
+    include_square = mode$include_square
+  )
+  
+  # Mode-specific extras: checklist effort priors (fit_PC_ARU_CL only) and the
+  # special-survey settings (PC_ARU_CL_SS only). Appended only when the selected
+  # fit function DECLARES the argument, so PC/ARU-only modes don't error on unused
+  # ones; NULL entries (fields a mode omits) are dropped so absent modes keep the
+  # fit-function defaults.
+  mode_extra_args <- list(
+    BBA_log_duration_prior_mean = priors_list$BBA_log_duration_prior_mean,
+    BBA_log_duration_prior_sd   = priors_list$BBA_log_duration_prior_sd,
+    LT_log_distance_prior_mean  = priors_list$LT_log_distance_prior_mean,
+    LT_log_distance_prior_sd    = priors_list$LT_log_distance_prior_sd,
+    
+    special_survey_types = mode$special_survey_types,
+    min_special_squares  = mode$min_special_squares,
+    special_share_tod    = mode$special_share_tod,
+    special_share_doy    = mode$special_share_doy
+  )
+  
+  mode_extra_args <- mode_extra_args[!vapply(mode_extra_args, is.null, logical(1))]
+  fit_args <- c(
+    fit_args,
+    mode_extra_args[names(mode_extra_args) %in% names(formals(fit_model))]
+  )
+  
+  mod <- try(do.call(fit_model, fit_args), silent = TRUE)
+
+  # PA: no family fallback exists; a failed fit skips the species.
+  if (inherits(mod, "try-error") || is.null(mod)) {
+    message("Model failed for ", sp_name, "; skipping this species.")
+    print(mod)
+    next
+  }
+
+  end_model   <- Sys.time()
+  fit_minutes <- round(as.numeric(end_model - start_model, units = "mins"), 1)
+  
+  print(summary(mod))
+  message("\n====================\n", i, "/", nrow(species_all), ": ", sp_name,
+          " (species_id = ", sp_code, "); ", fit_minutes, " min to fit model\n====================")
+  
+  
+  # ---- 6.7b Reference time of day, from the fitted TOD curve ----
+  # Read off TOD_global (estimated alongside the protocol intercepts), restricted
+  # to hours_supported so the reference is never placed where the curve
+  # extrapolates. Falls back to the empirical peak if unavailable.
+  optimal_TOD_fitted <- optimal_TOD_from_fit(mod, hours_allowed = hours_supported)
+  
+  grid  <- seq(min(hours_supported), max(hours_supported), by = 0.05)
+  curve <- TOD_curve_from_fit(mod, grid_hours = grid)
+  plot(pred ~ Hours_After_Reference, data = curve, type = "l", lwd = 2,
+       xlab = "Hours after reference", ylab = "TOD_global (log scale)")
+  rect(hours_supported - 0.5, par("usr")[3], hours_supported + 0.5, par("usr")[4],
+       col = adjustcolor("dodgerblue", 0.3), border = NA)
+  abline(h = 0, col = "grey70")
+  
+  # ---- 6.7c Fitted day-of-year curve, over a survey-density histogram ----
+  # The histogram shows where days_midpoint actually carries data. If the dip in
+  # the DOY curve lines up with a density trough at day 0, it is a centring/
+  # constraint artifact of pred_doy, not phenology.
+  DOY_BIN_DAYS <- 3   # histogram bin width (days)
+  
+  doy_range <- range(sp_dat$days_midpoint, na.rm = TRUE)
+  doy_grid  <- seq(doy_range[1], doy_range[2], by = 0.5)
+  doy_curve <- DOY_curve_from_fit(mod, grid_days = doy_grid)
+  
+  if (!is.null(doy_curve)) {
+    breaks <- seq(floor(doy_range[1]), ceiling(doy_range[2]) + DOY_BIN_DAYS,
+                  by = DOY_BIN_DAYS)
+    h_srv  <- hist(sp_dat$days_midpoint, breaks = breaks, plot = FALSE)
+    
+    op <- par(mar = c(5, 4, 4, 4) + 0.1)   # room for a right-hand axis
+    
+    # Histogram first (left axis). Inflate ylim so the bars fill only the lower
+    # ~third of the panel and sit UNDER the curve rather than over it.
+    plot(h_srv, col = "grey88", border = "grey70",
+         xlim = doy_range, ylim = c(0, max(h_srv$counts) * 3),
+         main = paste0(sp_name, " - day-of-year effect"),
+         xlab = "Days from safe-date midpoint", ylab = "n surveys")
+    
+    # Curve on top, on its own (right) axis.
+    par(new = TRUE)
+    plot(pred ~ days_midpoint, data = doy_curve, type = "l", lwd = 2,
+         xlim = doy_range, axes = FALSE, xlab = "", ylab = "")
+    axis(4)
+    mtext("DOY_global (log scale)", side = 4, line = 2.5)
+    
+    abline(h = 0, col = "grey70")                       # curve scale (right axis)
+    abline(v = 0, col = "dodgerblue", lwd = 2, lty = 2) # day 0 = pred_doy
+    
+    par(op)
+  }
+  
+  if (is.na(optimal_TOD_fitted)) {
+    optimal_TOD     <- optimal_TOD_empirical
+    optimal_TOD_src <- "empirical (fitted curve unavailable)"
+  } else {
+    optimal_TOD     <- optimal_TOD_fitted
+    optimal_TOD_src <- "fitted TOD curve"
+  }
+  
+  message("  reference hour = ", round(optimal_TOD, 2),
+          " (", optimal_TOD_src, "; empirical peak was ",
+          round(optimal_TOD_empirical, 2), ")")
+
+  # ---- 6.7d Survey type used for prediction ----
+  # Point count by default; a special protocol when an a priori override names
+  # it, or when the fitted contrast shows it is much more detectable at a fixed
+  # location (choose_prediction_survey()). The prediction grid is built here
+  # because one of its rows is the template for the contrast draws.
+  pred_grid <- make_pred_grid(grid_OBBA2, grid_OBBA3)
+
+  prediction_survey <- choose_prediction_survey(
+    mod          = mod,
+    sp_english   = sp_name,
+    template_row = pred_grid[1, ],
+    optimal_TOD  = optimal_TOD,
+    overrides    = pred_survey_overrides,
+    auto         = pred_survey_auto,
+    min_ratio    = pred_survey_min_ratio,
+    min_prob     = pred_survey_min_prob,
+    n_draws      = n_prediction_draws,
+    seed         = prediction_seed
+  )
+
+  if (!is.null(prediction_survey$contrasts)) {
+    print(prediction_survey$contrasts)
+  }
+  message("  prediction survey = ", prediction_survey$survey_type,
+          " (", prediction_survey$source, ")")
+
+  model_summaries[[sp_name]] <- list(
+    sp_name          = sp_name,
+    sp_code          = sp_code,
+    # PA: family fields kept so downstream readers of 07a summaries still work.
+    error_family           = error_family,
+    stationary_family_used = error_family,
+    family_fallback        = FALSE,
+    link                   = link,
+    priors           = priors_list,
+    int_strategy     = int_strategy,
+    strategy         = strategy,
+    n_surveys        = nrow(sp_dat),
+    n_detections     = n_det,
+    sp_det_summary     = sp_det_summary,       # per-atlas squares / detections
+    qualifying_atlases = qualifying_atlases,   # atlases that met the square threshold
+    n_covariates     = nrow(cov_df_sp),
+    covariates       = cov_df_sp,
+    pred_doy         = pred_doy,
+    fitted_TOD_curve = curve,      # no uncertainty
+    fitted_DOY_curve = doy_curve,  # no uncertainty
+    
+    optimal_TOD           = optimal_TOD,
+    optimal_TOD_empirical = optimal_TOD_empirical,
+    optimal_TOD_fitted    = optimal_TOD_fitted,
+    optimal_TOD_source    = optimal_TOD_src,
+    hours_supported       = hours_supported,
+
+    response_scale         = response_scale,   # expected_count or probability
+    prediction_survey_type = prediction_survey$survey_type,   # scale of the maps
+    prediction_survey      = prediction_survey,   # full record, incl. contrasts
+
+    tod_fixed_range       = mod$tod_fixed_range,
+    tod_knot_gap          = mod$tod_knot_gap,
+    fit_minutes           = fit_minutes,
+    summary_fixed         = mod$summary.fixed,
+    summary_hyperpar      = mod$summary.hyperpar
+  )
+  save_atomic(model_summaries, model_summaries_path)
+  
+  # ---- 6.8 Full-grid predictions ----
+  # Standardized to the prediction survey chosen in 6.7d (point count: at
+  # optimal_TOD; special survey: its own intercept, at its own typical hour if
+  # it shares the TOD smooth), days_midpoint = 0, with kappa_diff and site_iid
+  # omitted from pred_formula -> 1 - exp(-exp(eta)) is the probability for the
+  # median square/site (6.9 optionally averages over squares/sites instead).
+  start_prediction <- Sys.time()
+  message("Generating predictions for full 1-km grid (",
+          prediction_survey$survey_type, " scale)")
+
+  pred_formula <- make_pred_formula_multiatlas(
+    cov_df         = cov_df_sp,
+    special_effect = prediction_survey$effect_name,
+    include_TOD    = prediction_survey$include_TOD,
+    include_DOY    = prediction_survey$include_DOY
+  )
+
+  pred_grid <- pred_grid %>%
+    mutate(Hours_After_Reference = prediction_survey$Hours_After_Reference,
+           days_midpoint         = prediction_survey$days_midpoint)
+  
+  # PA: probabilities, not counts.
+  preds <- predict_all_pixels(
+    mod = mod, pred_grid = pred_grid, pred_formula = pred_formula,
+    n.samples = n_prediction_draws, seed = prediction_seed, link = link
+  )
+
+  # ---- 6.9 PA: optional integration over the omitted iid terms ----
+  # The lognormal factor exp(sigma^2 / 2) is specific to the log link and does
+  # NOT apply here. With vc_terms empty (default, as in 07a) the maps are the
+  # probability for the median square/site. Naming terms integrates over their
+  # summed variance (posterior median, plug-in) by Gauss-Hermite quadrature,
+  # giving the probability averaged over squares/sites.
+  vc_terms <- character(0)   # e.g. c("kappa_diff", "site_iid")
+
+  sigma2_iid <- 0
+  for (term in vc_terms) {
+    sigma2_iid <- sigma2_iid + get_var(mod$summary.hyperpar, term)
+  }
+
+  if (sigma2_iid > 0) {
+    idx2 <- which(pred_grid$Atlas == "OBBA2")
+    idx3 <- which(pred_grid$Atlas == "OBBA3")
+    preds$mu2 <- marginalize_cloglog_iid(eta     = preds$eta[idx2, , drop = FALSE],
+                                         sigma2  = sigma2_iid,
+                                         n_nodes = n_gauss_hermite_nodes)
+    preds$mu3 <- marginalize_cloglog_iid(eta     = preds$eta[idx3, , drop = FALSE],
+                                         sigma2  = sigma2_iid,
+                                         n_nodes = n_gauss_hermite_nodes)
+  }
+
+  vc_record <- list(
+    method     = "Gauss-Hermite integration over omitted iid terms (cloglog)",
+    terms      = vc_terms,
+    sigma2_iid = sigma2_iid,   # summed posterior-median variance; 0 = not applied
+    n_nodes    = n_gauss_hermite_nodes,
+    scale      = if (sigma2_iid > 0) "averaged over squares/sites" else "median square/site"
+  )
+  message("  iid integration: ", vc_record$scale,
+          " (sigma2 = ", round(sigma2_iid, 3), ")")
+  model_summaries[[sp_name]]$variance_correction <- vc_record
+  save_atomic(model_summaries, model_summaries_path)
+
+  # ---- 6.10 PA: terrestrial open-water correction ----
+  # Detection intensity is thinned by the land fraction f = 1 - open_water:
+  # 1 - exp(-lambda * f) = 1 - (1 - p)^f. (Exact for the median-site surface;
+  # a close approximation once 6.9 has integrated over iid terms.)
+  preds$mu2_Corrected_for_Water <- 1 - (1 - preds$mu2)^(1 - grid_OBBA2$open_water)
+  preds$mu3_Corrected_for_Water <- 1 - (1 - preds$mu3)^(1 - grid_OBBA3$open_water)
+  
+  # ---- 6.11 Summarize pixel predictions and hex draws ----
+  pred_summary <- summarize_predictions(preds$mu2, preds$mu3)
+  pred_summary_Corrected_for_Water <- summarize_predictions(
+    preds$mu2_Corrected_for_Water, preds$mu3_Corrected_for_Water
+  )
+  
+  g2 <- pred_grid %>% filter(Atlas == "OBBA2")
+  g3 <- pred_grid %>% filter(Atlas == "OBBA3")
+  
+  preds_OBBA2_summary <- bind_cols(
+    g2 %>% st_drop_geometry() %>% select(pixel_id, hex_id), pred_summary$OBBA2
+  )
+  preds_OBBA3_summary <- bind_cols(
+    g3 %>% st_drop_geometry() %>% select(pixel_id, hex_id), pred_summary$OBBA3
+  )
+  preds_abs_change_summary <- bind_cols(
+    g2 %>% st_drop_geometry() %>% select(pixel_id, hex_id), pred_summary$abs_change
+  )
+  
+  hex_draws <- make_hex_draws(g2 = g2, mu2 = preds$mu2, mu3 = preds$mu3)
+  
+  preds_OBBA2_summary_Corrected_for_Water <- bind_cols(
+    g2 %>% st_drop_geometry() %>% select(pixel_id, hex_id),
+    pred_summary_Corrected_for_Water$OBBA2
+  )
+  preds_OBBA3_summary_Corrected_for_Water <- bind_cols(
+    g3 %>% st_drop_geometry() %>% select(pixel_id, hex_id),
+    pred_summary_Corrected_for_Water$OBBA3
+  )
+  preds_abs_change_summary_Corrected_for_Water <- bind_cols(
+    g2 %>% st_drop_geometry() %>% select(pixel_id, hex_id),
+    pred_summary_Corrected_for_Water$abs_change
+  )
+  
+  hex_draws_Corrected_for_Water <- make_hex_draws(
+    g2 = g2, mu2 = preds$mu2_Corrected_for_Water, mu3 = preds$mu3_Corrected_for_Water
+  )
+  
+  end_prediction <- Sys.time()
+  pred_minutes   <- round(as.numeric(end_prediction - start_prediction, units = "mins"), 1)
+  
+  # ---- 6.12 Observed survey coverage by atlas square ----
+  sp_square_summary <- sp_dat %>%
+    st_drop_geometry() %>%
+    group_by(Atlas, square_id) %>%
+    summarise(
+      n_surveys    = n(),
+      total_count  = sum(count_raw),   # PA: original counts
+      n_detections = sum(count > 0),
+      BCR          = names(which.max(table(BCR))),
+      .groups      = "drop"
+    )
+  
+  # ---- 6.13 Save prediction products ----
+  save_atomic(
+    list(
+      sp_name           = sp_name,
+      sp_code           = sp_code,
+      sp_safe_dates     = sp_safe_dates,
+      sp_square_summary = sp_square_summary,
+      qualifying_atlases = qualifying_atlases,   # flag single-atlas qualifiers for change products
+      
+      error_family           = error_family,
+      stationary_family_used = error_family,
+      family_fallback        = FALSE,
+      link                   = link,   # mu = 1 - exp(-exp(eta)): probabilities
+      priors       = priors_list,
+      int_strategy = int_strategy,
+      strategy     = strategy,
+      
+      fit_minutes  = fit_minutes,
+      pred_minutes = pred_minutes,
+      
+      summary_fixed    = mod$summary.fixed,
+      summary_hyperpar = mod$summary.hyperpar,
+      
+      pred_doy           = pred_doy,
+      optimal_TOD        = optimal_TOD,   # point-count reference hour
+      response_scale         = response_scale,   # expected_count or probability
+      prediction_survey_type = prediction_survey$survey_type,   # scale of the maps
+      prediction_survey      = prediction_survey,
+      prediction_seed    = prediction_seed,
+      n_prediction_draws = n_prediction_draws,
+      
+      # Scale metadata (median square/site unless 6.9 integrated over iid terms).
+      variance_correction = vc_record,
+      
+      # Predictions for terrestrial habitats.
+      OBBA2      = preds_OBBA2_summary,
+      OBBA3      = preds_OBBA3_summary,
+      abs_change = preds_abs_change_summary,
+      hex_draws  = hex_draws,
+      
+      # As above, additionally scaled by the non-open-water pixel fraction.
+      OBBA2_Corrected_for_Water      = preds_OBBA2_summary_Corrected_for_Water,
+      OBBA3_Corrected_for_Water      = preds_OBBA3_summary_Corrected_for_Water,
+      abs_change_Corrected_for_Water = preds_abs_change_summary_Corrected_for_Water,
+      hex_draws_Corrected_for_Water  = hex_draws_Corrected_for_Water
+    ),
+    pred_path
+  )
+  
+  message("\n====================\n", i, "/", nrow(species_all), ": ", sp_name,
+          " (species_id = ", sp_code, "); ", pred_minutes,
+          " min to generate predictions\n====================")
+  
+  rm(preds, pred_grid, g2, g3, hex_draws, hex_draws_Corrected_for_Water)
+  gc(verbose = FALSE)
+}
+
+message("\n07b_fit_PA_models_and_predict.R complete  (mode: ", survey_set, ").")

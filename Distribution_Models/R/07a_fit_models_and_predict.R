@@ -73,6 +73,10 @@ source(file.path(paths$functions, "survey_processing_utils.R"))   # add_site_ids
 
 survey_set         <- "PC_ARU_CL_SS"
 
+# BCR-specific ARU adjustment: one extra log-scale offset per BCR, applied to
+# all three ARU contrasts (1, 3, 5 min) together. FALSE reproduces earlier fits.
+include_aru_bcr    <- TRUE
+
 # ============================================================
 # Additional settings that could be modified
 # ============================================================
@@ -83,12 +87,14 @@ prediction_seed    <- 0
 
 # Optional: restrict to a subset for testing, e.g. c("Redhead", "Ruddy Duck")
 # (NULL = run all).
-species_test <- species_test <- c("Palm Warbler","Eastern Screech-Owl",
-                                  "Eastern Whip-poor-will","Common Nighthawk",
-                                  "Great Gray Owl","Boreal Owl",
-                                  "Great Blue Heron","Least Bittern",
-                                  "Sora","Olive-sided Flycatcher",
-                                  "Canada Goose","Red-winged Blackbird")
+species_test <- c("Palm Warbler","Eastern Screech-Owl",
+                  "Eastern Whip-poor-will","Common Nighthawk",
+                  "Great Gray Owl","Boreal Owl",
+                  "Great Blue Heron","Least Bittern",
+                  "Sora","Olive-sided Flycatcher",
+                  "Canada Goose","Red-winged Blackbird")
+
+species_test <- c("Palm Warbler","Olive-sided Flycatcher","Winter Wren","Tufted Titmouse","Trumpeter Swan","Brewer's Blackbird","Upland Sandpiper","Peregrine Falcon")
 
 # ---- Survey type used for prediction (see choose_prediction_survey()) ----
 # Only matters in modes with special surveys (fit_PC_ARU_CL with
@@ -109,6 +115,11 @@ pred_survey_overrides <- c(
 pred_survey_auto      <- TRUE
 pred_survey_min_ratio <- 2
 pred_survey_min_prob  <- 0.95
+
+# 3. How the contrast is computed: "approximate" (seconds; posterior means plus
+#    a normal approximation on effect_SS) or "sampling" (joint posterior draws;
+#    exact but slow). See choose_prediction_survey().
+pred_survey_method    <- "approximate"
 
 
 # Modes (survey types, fit function, structural switches, special-survey
@@ -174,11 +185,14 @@ priors_list <- list(
   prior_range_abund  = c(300, 0.1),   # P(range < 300 km) = 0.1
   prior_sigma_abund  = c(1, 0.1),     # P(sigma > 1)    = 0.1
   prior_range_change = c(300, 0.1),   # P(range < 300 km) = 0.1
-  prior_sigma_change = c(0.3, 0.1),   # P(sigma > 0.3)    = 0.1
+  prior_sigma_change = c(1, 0.1),   # P(sigma > 0.3)    = 0.1
   
   # iid sinks: atlas-square (~10 km) and site (repeated visits).
   kappa_pcprec_diff  = c(1, 0.1),     # P(sigma_square > 1) = 0.1
   prior_site_pcprec  = c(1, 0.1),     # P(sigma_site  > 1) = 0.1
+  
+  # BCR-specific ARU adjustment (iid over BCRs with ARU data, sum-to-zero).
+  prior_aru_bcr_pcprec = c(0.5, 0.1), # P(sigma_ARU_BCR > 0.5) = 0.1
   
   # Time-of-day smooth: FIXED range + estimated sigma.
   fixed_TOD_range = 4.5,
@@ -566,7 +580,10 @@ for (i in seq_len(nrow(species_all))) {
     strategy     = strategy,
     
     include_site   = mode$include_site,
-    include_square = mode$include_square
+    include_square = mode$include_square,
+    
+    include_aru_bcr      = include_aru_bcr,
+    prior_aru_bcr_pcprec = priors_list$prior_aru_bcr_pcprec
   )
   
   # Mode-specific extras: checklist effort priors (fit_PC_ARU_CL only) and the
@@ -687,14 +704,14 @@ for (i in seq_len(nrow(species_all))) {
   message("  reference hour = ", round(optimal_TOD, 2),
           " (", optimal_TOD_src, "; empirical peak was ",
           round(optimal_TOD_empirical, 2), ")")
-
+  
   # ---- 6.7d Survey type used for prediction ----
   # Point count by default; a special protocol when an a priori override names
   # it, or when the fitted contrast shows it is much more detectable at a fixed
   # location (choose_prediction_survey()). The prediction grid is built here
   # because one of its rows is the template for the contrast draws.
   pred_grid <- make_pred_grid(grid_OBBA2, grid_OBBA3)
-
+  
   prediction_survey <- choose_prediction_survey(
     mod          = mod,
     sp_english   = sp_name,
@@ -704,16 +721,17 @@ for (i in seq_len(nrow(species_all))) {
     auto         = pred_survey_auto,
     min_ratio    = pred_survey_min_ratio,
     min_prob     = pred_survey_min_prob,
+    method       = pred_survey_method,
     n_draws      = n_prediction_draws,
     seed         = prediction_seed
   )
-
+  
   if (!is.null(prediction_survey$contrasts)) {
     print(prediction_survey$contrasts)
   }
   message("  prediction survey = ", prediction_survey$survey_type,
           " (", prediction_survey$source, ")")
-
+  
   model_summaries[[sp_name]] <- list(
     sp_name          = sp_name,
     sp_code          = sp_code,
@@ -738,11 +756,14 @@ for (i in seq_len(nrow(species_all))) {
     optimal_TOD_fitted    = optimal_TOD_fitted,
     optimal_TOD_source    = optimal_TOD_src,
     hours_supported       = hours_supported,
-
+    
     response_scale         = response_scale,   # expected_count or probability
     prediction_survey_type = prediction_survey$survey_type,   # scale of the maps
     prediction_survey      = prediction_survey,   # full record, incl. contrasts
-
+    
+    use_aru_bcr           = isTRUE(mod$use_aru_bcr),
+    summary_aru_bcr       = aru_bcr_summary(mod),   # per-BCR ARU deviation (log scale)
+    
     tod_fixed_range       = mod$tod_fixed_range,
     tod_knot_gap          = mod$tod_knot_gap,
     fit_minutes           = fit_minutes,
@@ -760,14 +781,14 @@ for (i in seq_len(nrow(species_all))) {
   start_prediction <- Sys.time()
   message("Generating predictions for full 1-km grid (",
           prediction_survey$survey_type, " scale)")
-
+  
   pred_formula <- make_pred_formula_multiatlas(
     cov_df         = cov_df_sp,
     special_effect = prediction_survey$effect_name,
     include_TOD    = prediction_survey$include_TOD,
     include_DOY    = prediction_survey$include_DOY
   )
-
+  
   pred_grid <- pred_grid %>%
     mutate(Hours_After_Reference = prediction_survey$Hours_After_Reference,
            days_midpoint         = prediction_survey$days_midpoint)
@@ -876,6 +897,7 @@ for (i in seq_len(nrow(species_all))) {
       
       summary_fixed    = mod$summary.fixed,
       summary_hyperpar = mod$summary.hyperpar,
+      summary_aru_bcr  = aru_bcr_summary(mod),   # per-BCR ARU deviation (log scale)
       
       pred_doy           = pred_doy,
       optimal_TOD        = optimal_TOD,   # point-count reference hour

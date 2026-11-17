@@ -14,10 +14,13 @@
 #                             select_modelable_species (07c), choose_error_family (07c)
 #   3. Model fitting          make_TOD_mesh, TOD_curve_from_fit,
 #                             optimal_TOD_from_fit, make_DOY_mesh,
-#                             DOY_curve_from_fit, fit_PC_ARU, fit_PC_ARU_CL
+#                             DOY_curve_from_fit, add_aru_bcr_index,
+#                             aru_bcr_summary, fit_PC_ARU, fit_PC_ARU_CL
 #   4. Prediction             make_pred_formula_multiatlas, make_pred_grid,
 #                             predict_inla, predict_all_pixels,
-#                             choose_prediction_survey
+#                             choose_prediction_survey,
+#                             approximate_survey_contrasts,
+#                             sampled_survey_contrasts
 #   5. Variance correction    get_var, has_hyper, sample_hyper_vars,
 #                             make_lognormal_correction,
 #                             apply_lognormal_correction,
@@ -732,6 +735,69 @@ DOY_curve_from_fit <- function(mod, grid_days, comp_name = "DOY_global") {
 
 
 # ==============================================================================
+# add_aru_bcr_index()  --  index for the BCR-specific ARU adjustment (aru_bcr)
+#
+# Shared by fit_PC_ARU() and fit_PC_ARU_CL(). Call it on the FINAL row set (after
+# all species- and mode-specific filtering).
+#
+# Levels are the BCRs that contain ARU rows for THIS species, so the
+# sum-to-zero constraint averages only over BCRs that inform the term. Non-ARU
+# rows (and ARU rows with no BCR) point at level 1 with aru_bcr_w = 0, so they
+# contribute nothing -- the same zero-weight idiom as site_iid.
+#
+# Returns list(sp_dat, use_aru_bcr, aru_bcr_levels, n_aru_bcr), where sp_dat
+# gains aru_bcr_idx and aru_bcr_w columns when include_aru_bcr = TRUE.
+# ==============================================================================
+
+add_aru_bcr_index <- function(sp_dat, include_aru_bcr, min_aru_bcr_levels) {
+
+  out <- list(sp_dat = sp_dat, use_aru_bcr = FALSE,
+              aru_bcr_levels = character(0), n_aru_bcr = 0L)
+
+  if (!isTRUE(include_aru_bcr)) return(out)
+
+  if (!"BCR" %in% names(sp_dat)) {
+    stop("include_aru_bcr = TRUE needs a BCR column in sp_dat.")
+  }
+
+  bcr_chr    <- as.character(sp_dat$BCR)
+  is_aru_bcr <- sp_dat$ARU == 1 & !is.na(bcr_chr)
+
+  aru_bcr_levels <- sort(unique(bcr_chr[is_aru_bcr]))
+
+  sp_dat$aru_bcr_idx <- 1L
+  sp_dat$aru_bcr_idx[is_aru_bcr] <- match(bcr_chr[is_aru_bcr], aru_bcr_levels)
+  sp_dat$aru_bcr_w <- as.numeric(is_aru_bcr)
+
+  n_aru_bcr   <- length(aru_bcr_levels)
+  use_aru_bcr <- n_aru_bcr >= min_aru_bcr_levels
+
+  message(
+    "  ARU x BCR adjustment: ARU data in ", n_aru_bcr, " BCR(s) {",
+    paste(aru_bcr_levels, collapse = ", "), "}",
+    if (!use_aru_bcr) paste0("  -- TERM DROPPED (needs >= ", min_aru_bcr_levels,
+                             " BCRs)") else ""
+  )
+
+  list(sp_dat = sp_dat, use_aru_bcr = use_aru_bcr,
+       aru_bcr_levels = aru_bcr_levels, n_aru_bcr = n_aru_bcr)
+}
+
+# Posterior summary of the BCR-specific ARU adjustment, one row per BCR.
+# Each row is that BCR's log-scale deviation; exp(mean) is the factor by which
+# all three ARU-vs-point-count contrasts are multiplied there. NULL when the
+# term was not fitted.
+aru_bcr_summary <- function(mod) {
+  if (!isTRUE(mod$use_aru_bcr)) return(NULL)
+  s <- mod$summary.random$aru_bcr
+  if (is.null(s)) return(NULL)
+  data.frame(BCR = mod$aru_bcr_levels,
+             s[, setdiff(names(s), "ID"), drop = FALSE],
+             row.names = NULL, check.names = FALSE)
+}
+
+
+# ==============================================================================
 # fit_PC_ARU()  --  point counts + ARUs, with a site-level iid random effect
 #
 # Repeated visits to one station (especially short ARU recordings) are
@@ -786,6 +852,18 @@ fit_PC_ARU <- function(
     # 1-minute window recovers the bulk of a 5-minute count. mean 0 stays
     # agnostic about sign.
     aru_prior_sd = log(5) / 2,
+
+    # BCR-specific ARU adjustment (aru_bcr). One iid log-scale deviation per BCR,
+    # added to every ARU row in that BCR, so the 1-, 3- and 5-min ARU contrasts
+    # all change by the SAME factor exp(aru_bcr[b]) there (one extra term, not
+    # three per BCR). constr = TRUE: deviations sum to zero over the BCRs that
+    # contain ARU data, so effect_ARU_* stay the (unweighted) BCR-average
+    # contrasts. The PC prior shrinks toward no BCR variation, i.e. toward the
+    # model without this term. Dropped (with a message) when ARU data occur in
+    # fewer than min_aru_bcr_levels BCRs. Default FALSE reproduces earlier fits.
+    include_aru_bcr      = FALSE,
+    prior_aru_bcr_pcprec = c(0.5, 0.1),   # P(sigma_ARU_BCR > 0.5) = 0.1
+    min_aru_bcr_levels   = 2,
     #
     # Atlas-square iid prior
     kappa_pcprec_diff = c(0.5, 0.1),    # P(sigma_square > 0.5) = 0.1 -> fine-scale (10-km square) sink
@@ -971,7 +1049,16 @@ fit_PC_ARU <- function(
     if (!use_square_re) "  -- TERM DISABLED (include_square = FALSE)" else ""
   )
   # ----------------------------------------------------------------------------
-  
+  # 3d. BCR-specific ARU adjustment (see add_aru_bcr_index())
+  # ----------------------------------------------------------------------------
+  aru_bcr_index  <- add_aru_bcr_index(sp_dat             = sp_dat,
+                                      include_aru_bcr    = include_aru_bcr,
+                                      min_aru_bcr_levels = min_aru_bcr_levels)
+  sp_dat         <- aru_bcr_index$sp_dat
+  use_aru_bcr    <- aru_bcr_index$use_aru_bcr
+  n_aru_bcr      <- aru_bcr_index$n_aru_bcr
+  # ----------------------------------------------------------------------------
+
   # ------------------------------------------------------------
   # 6. Build spatial SPDE models
   # ------------------------------------------------------------
@@ -1073,6 +1160,11 @@ fit_PC_ARU <- function(
     prior = "pcprec",
     param = prior_site_pcprec
   )
+
+  pc_prec_aru_bcr <- list(
+    prior = "pcprec",
+    param = prior_aru_bcr_pcprec
+  )
   
   # ------------------------------------------------------------
   # 9. Build covariate components and formula terms
@@ -1163,6 +1255,19 @@ fit_PC_ARU <- function(
       ""
     },
     
+    # BCR-specific ARU adjustment, only when ARU data span enough BCRs.
+    if (use_aru_bcr) {
+      "+ aru_bcr(
+         aru_bcr_idx,
+         model = 'iid',
+         n = n_aru_bcr,
+         constr = TRUE,
+         hyper = list(prec = pc_prec_aru_bcr)
+       )"
+    } else {
+      ""
+    },
+
     # Site-level iid, only when there are enough multi-visit sites.
     # constr = TRUE (as for kappa_diff) makes the site effects sum to zero, so
     # dropping the term at prediction predicts the median site
@@ -1213,7 +1318,11 @@ fit_PC_ARU <- function(
     # site_w is 0 at singleton sites, so those rows contribute nothing.
     # Same idiom as `ARU_5min * effect_ARU_5min` above.
     if (use_site_re) " + site_w * site_iid" else "",
-    
+
+    # aru_bcr_w is 1 on ARU rows only, so this shifts all three ARU contrasts
+    # by the same BCR-specific amount and leaves every other row untouched.
+    if (use_aru_bcr) " + aru_bcr_w * aru_bcr" else "",
+
     if (nchar(covar_terms_str) > 0) {
       paste0(" + ", covar_terms_str)
     } else {
@@ -1341,6 +1450,9 @@ fit_PC_ARU <- function(
   fit$doy_fixed_range <- fixed_DOY_range
   fit$doy_knot_gap    <- DOY_knot_gap
   fit$aru_prior_sd    <- aru_prior_sd   # shared SD for the ARU_1min/3min/5min contrasts
+  fit$use_aru_bcr     <- use_aru_bcr    # BCR-specific ARU adjustment fitted?
+  fit$aru_bcr_levels  <- aru_bcr_index$aru_bcr_levels   # BCR label for each aru_bcr level
+  fit$prior_aru_bcr_pcprec <- prior_aru_bcr_pcprec
   fit$nb_pc_lambda    <- lambda         # NA when family = "poisson"
   fit$nb_pc_seed      <- nb_pc_seed
   
@@ -1383,6 +1495,13 @@ fit_PC_ARU_CL <- function(
     # log(1/5): most birds at a location are detected in the first minute, so a
     # 1-minute window recovers the bulk of a 5-minute count.
     aru_prior_sd = log(5) / 2,
+
+    # BCR-specific ARU adjustment (aru_bcr): one iid log-scale deviation per BCR
+    # applied to all three ARU contrasts at once. See fit_PC_ARU() for details.
+    # Default FALSE reproduces earlier fits.
+    include_aru_bcr      = FALSE,
+    prior_aru_bcr_pcprec = c(0.5, 0.1),   # P(sigma_ARU_BCR > 0.5) = 0.1
+    min_aru_bcr_levels   = 2,
 
     # Checklist effort effects: log-linear corrections on centred log-effort.
     #   BBA:  beta_BBA * log(Survey_Duration_Minutes / median_BBA_duration)
@@ -1704,7 +1823,18 @@ fit_PC_ARU_CL <- function(
     "  square RE: ", n_square_levels, " atlas-square levels",
     if (!use_square_re) "  -- TERM DISABLED (include_square = FALSE)" else ""
   )
-  
+
+  # ----------------------------------------------------------------------------
+  # BCR-specific ARU adjustment (see add_aru_bcr_index()). After 3a, so it sees
+  # the final row set; special rows already carry ARU = 0.
+  # ----------------------------------------------------------------------------
+  aru_bcr_index  <- add_aru_bcr_index(sp_dat             = sp_dat,
+                                      include_aru_bcr    = include_aru_bcr,
+                                      min_aru_bcr_levels = min_aru_bcr_levels)
+  sp_dat         <- aru_bcr_index$sp_dat
+  use_aru_bcr    <- aru_bcr_index$use_aru_bcr
+  n_aru_bcr      <- aru_bcr_index$n_aru_bcr
+
   # ----------------------------------------------------------------------------
   # 3c. Sample-size report
   # ----------------------------------------------------------------------------
@@ -1958,6 +2088,11 @@ fit_PC_ARU_CL <- function(
     prior = "pcprec",
     param = prior_site_pcprec
   )
+
+  pc_prec_aru_bcr <- list(
+    prior = "pcprec",
+    param = prior_aru_bcr_pcprec
+  )
   
   # ------------------------------------------------------------
   # 9. Build covariate components and formula terms
@@ -2106,6 +2241,19 @@ fit_PC_ARU_CL <- function(
       ""
     },
     
+    # BCR-specific ARU adjustment, only when ARU data span enough BCRs.
+    if (use_aru_bcr) {
+      "+ aru_bcr(
+         aru_bcr_idx,
+         model = 'iid',
+         n = n_aru_bcr,
+         constr = TRUE,
+         hyper = list(prec = pc_prec_aru_bcr)
+       )"
+    } else {
+      ""
+    },
+
     # Site-level iid: ONE component, entered in the shared predictor below, so
     # every survey type draws on the same site nodes and the same variance.
     # constr = TRUE (as for kappa_diff) makes the site effects sum to zero, so
@@ -2193,12 +2341,17 @@ fit_PC_ARU_CL <- function(
     ""
   }
 
+  # aru_bcr_w is 1 on ARU rows only, so the BCR term shifts all three ARU
+  # contrasts by the same BCR-specific amount and leaves every other row alone.
+  aru_bcr_term <- if (use_aru_bcr) " + aru_bcr_w * aru_bcr" else ""
+
   model_formula <- stats::as.formula(paste0(
     shared_terms,
     " +
       ARU_1min * effect_ARU_1min +
       ARU_3min * effect_ARU_3min +
       ARU_5min * effect_ARU_5min",
+    aru_bcr_term,
     bba_terms,
     lt_terms,
     special_terms
@@ -2332,6 +2485,9 @@ fit_PC_ARU_CL <- function(
   fit$lt_log_distance_prior  <- c(mean = LT_log_distance_prior_mean,
                                   sd   = LT_log_distance_prior_sd)
   fit$aru_prior_sd       <- aru_prior_sd   # shared SD for the ARU_1min/3min/5min contrasts
+  fit$use_aru_bcr        <- use_aru_bcr    # BCR-specific ARU adjustment fitted?
+  fit$aru_bcr_levels     <- aru_bcr_index$aru_bcr_levels   # BCR label for each aru_bcr level
+  fit$prior_aru_bcr_pcprec <- prior_aru_bcr_pcprec
   fit$nb_pc_lambda       <- lambda         # NA when family = "poisson"
   fit$nb_pc_seed         <- nb_pc_seed
   
@@ -2525,6 +2681,17 @@ predict_all_pixels <- function(mod, pred_grid, pred_formula,
 #      with the largest median ratio wins.
 #   3. Otherwise the 5-min point count.
 #
+# How the contrast is computed (method):
+#   "approximate" (default; seconds) -- the log ratio's posterior MEAN is exact:
+#      the posterior mean of effect_SS (summary.fixed) plus the fitted TOD/DOY
+#      curves (posterior-mean weights, as for optimal_TOD). Its SD is taken as
+#      the SD of effect_SS alone, and quantiles / P(ratio > 1) come from a
+#      normal approximation on the log scale. This ignores uncertainty in the
+#      TOD/DOY curve values and their correlation with effect_SS. effect_SS is
+#      usually by far the least certain term, so the decision rarely changes.
+#   "sampling" (slow) -- joint posterior draws via inlabru::generate(), which
+#      samples the whole latent field; exact up to Monte Carlo error.
+#
 # Raw detection rates are deliberately NOT used: special surveys are placed
 # where the species is expected (marshes, owl habitat), so their raw rates mix
 # protocol with location. Under a log link the ratio is in expected count;
@@ -2533,25 +2700,30 @@ predict_all_pixels <- function(mod, pred_grid, pred_formula,
 # mod           Fitted model. Only fit_PC_ARU_CL() fits carry special types;
 #               anything else returns the point-count default.
 # sp_english    Species name, matched against names(overrides).
-# template_row  One row of the prediction grid (sf). Replicated to build the
-#               contrast rows, so every component input generate() may evaluate
-#               is present.
+# template_row  One row of the prediction grid (sf). Used only by method =
+#               "sampling", which replicates it to build the contrast rows so
+#               every component input generate() may evaluate is present.
 # optimal_TOD   Point-count reference hour (from 07a/07b, section 6.7b).
+# method        "approximate" (default) or "sampling"; see above.
+# n_draws, seed Used only by method = "sampling".
 # Returns a list: survey_type, effect_name (NULL for point counts),
 #   include_TOD, include_DOY, Hours_After_Reference, days_midpoint, source,
-#   contrasts (one row per kept special type; NULL if none).
+#   method, contrasts (one row per kept special type; NULL if none).
 # ==============================================================================
 
 choose_prediction_survey <- function(mod,
                                      sp_english,
-                                     template_row,
+                                     template_row = NULL,
                                      optimal_TOD,
                                      overrides = character(0),
                                      auto      = TRUE,
                                      min_ratio = 2,
                                      min_prob  = 0.95,
+                                     method    = c("approximate", "sampling"),
                                      n_draws   = 500,
                                      seed      = 0) {
+
+  method <- match.arg(method)
 
   # ---- Default: 5-min point count at the fitted peak hour ----
   choice <- list(
@@ -2562,6 +2734,7 @@ choose_prediction_survey <- function(mod,
     Hours_After_Reference = optimal_TOD,
     days_midpoint         = 0,
     source                = "default (5-min point count)",
+    method                = method,
     contrasts             = NULL
   )
 
@@ -2583,6 +2756,147 @@ choose_prediction_survey <- function(mod,
     }
     return(choice)
   }
+
+  slugs <- mod$special_slug[special_types]
+
+  # ---- Contrast of each kept special type against the point-count reference ----
+  if (method == "approximate") {
+    contrasts <- approximate_survey_contrasts(mod           = mod,
+                                              special_types = special_types,
+                                              optimal_TOD   = optimal_TOD)
+  } else {
+    if (is.null(template_row)) {
+      stop("choose_prediction_survey(): method = 'sampling' needs template_row.")
+    }
+    contrasts <- sampled_survey_contrasts(mod           = mod,
+                                          special_types = special_types,
+                                          template_row  = template_row,
+                                          optimal_TOD   = optimal_TOD,
+                                          n_draws       = n_draws,
+                                          seed          = seed)
+  }
+
+  contrasts$qualifies <- contrasts$ratio_q50 >= min_ratio &
+                         contrasts$prob_ratio_gt_1 >= min_prob
+
+  choice$contrasts <- contrasts
+
+  # Switch the choice to a special type.
+  use_special <- function(choice, type, source) {
+    choice$survey_type <- type
+    choice$effect_name <- paste0("effect_", slugs[[type]])
+    choice$include_TOD <- isTRUE(mod$special_share_tod[[type]])
+    choice$include_DOY <- isTRUE(mod$special_share_doy[[type]])
+    if (choice$include_TOD) {
+      choice$Hours_After_Reference <- mod$special_ref_TOD[[type]]
+    }
+    choice$source <- source
+    choice
+  }
+
+  # ---- 1. A priori override ----
+  if (!is.na(override)) {
+    if (override %in% special_types) {
+      return(use_special(choice, override, "a priori override"))
+    }
+    warning(sp_english, ": override '", override, "' did not keep an ",
+            "intercept in this fit (absent or below its square threshold); ",
+            "using the fitted-contrast rule instead.", call. = FALSE)
+  }
+
+  # ---- 2. Fitted contrast ----
+  if (isTRUE(auto) && any(contrasts$qualifies)) {
+    qualifying <- contrasts[contrasts$qualifies, ]
+    best_type  <- qualifying$survey_type[which.max(qualifying$ratio_q50)]
+    return(use_special(choice, best_type, "fitted contrast"))
+  }
+
+  # ---- 3. Point-count default ----
+  choice
+}
+
+
+# ------------------------------------------------------------------------------
+# Contrast helpers for choose_prediction_survey(). Both return one row per kept
+# special type with: survey_type, effect_name, log_ratio_mean, log_ratio_sd,
+# ratio_q05, ratio_q50, ratio_q95, prob_ratio_gt_1. "Ratio" is the special
+# survey's standardized prediction divided by the point count's, at one place.
+# ------------------------------------------------------------------------------
+
+# Fast version: no posterior sampling.
+#   mean of log ratio = mean(effect_SS) + [TOD(type hour)] + [DOY(0)]
+#                       - TOD(optimal_TOD) - DOY(0)
+# using posterior means throughout ([] only if the type shares that smooth);
+# this mean is exact because every term is linear in the latent field. The SD is
+# approximated by sd(effect_SS), and quantiles / P(ratio > 1) use a normal
+# distribution on the log scale.
+approximate_survey_contrasts <- function(mod, special_types, optimal_TOD) {
+
+  slugs <- mod$special_slug[special_types]
+
+  # Posterior-mean value of a fitted 1-D smooth at a single input; 0 when the
+  # smooth is absent from the model (it then contributes nothing).
+  smooth_value <- function(curve) {
+    if (is.null(curve)) 0 else curve$pred[1]
+  }
+
+  TOD_reference <- smooth_value(TOD_curve_from_fit(mod, grid_hours = optimal_TOD))
+  DOY_reference <- smooth_value(DOY_curve_from_fit(mod, grid_days = 0))
+  point_count_eta <- TOD_reference + DOY_reference
+
+  z_90 <- stats::qnorm(0.95)   # for the 5% and 95% quantiles
+
+  contrasts <- data.frame(
+    survey_type     = special_types,
+    effect_name     = paste0("effect_", slugs),
+    log_ratio_mean  = NA_real_,
+    log_ratio_sd    = NA_real_,
+    ratio_q05       = NA_real_,
+    ratio_q50       = NA_real_,
+    ratio_q95       = NA_real_,
+    prob_ratio_gt_1 = NA_real_
+  )
+
+  for (k in seq_along(special_types)) {
+    type        <- special_types[k]
+    effect_name <- contrasts$effect_name[k]
+
+    if (!effect_name %in% rownames(mod$summary.fixed)) {
+      stop("approximate_survey_contrasts(): '", effect_name,
+           "' not found in summary.fixed.")
+    }
+    effect_mean <- mod$summary.fixed[effect_name, "mean"]
+    effect_sd   <- mod$summary.fixed[effect_name, "sd"]
+
+    # Standardized special-survey linear predictor, minus the shared terms.
+    special_eta <- effect_mean
+    if (isTRUE(mod$special_share_tod[[type]])) {
+      special_eta <- special_eta +
+        smooth_value(TOD_curve_from_fit(mod, grid_hours = mod$special_ref_TOD[[type]]))
+    }
+    if (isTRUE(mod$special_share_doy[[type]])) {
+      special_eta <- special_eta + DOY_reference
+    }
+
+    log_ratio_mean <- special_eta - point_count_eta
+    log_ratio_sd   <- effect_sd
+
+    contrasts$log_ratio_mean[k]  <- log_ratio_mean
+    contrasts$log_ratio_sd[k]    <- log_ratio_sd
+    contrasts$ratio_q05[k]       <- exp(log_ratio_mean - z_90 * log_ratio_sd)
+    contrasts$ratio_q50[k]       <- exp(log_ratio_mean)
+    contrasts$ratio_q95[k]       <- exp(log_ratio_mean + z_90 * log_ratio_sd)
+    contrasts$prob_ratio_gt_1[k] <- stats::pnorm(log_ratio_mean / log_ratio_sd)
+  }
+
+  contrasts
+}
+
+# Slow version: joint posterior draws of the same contrast via
+# inlabru::generate() (samples the whole latent field; exact up to Monte Carlo
+# error). Row 1 of the contrast data is the point-count reference.
+sampled_survey_contrasts <- function(mod, special_types, template_row,
+                                     optimal_TOD, n_draws, seed) {
 
   slugs <- mod$special_slug[special_types]
 
@@ -2630,59 +2944,27 @@ choose_prediction_survey <- function(mod,
   contrasts <- data.frame(
     survey_type     = special_types,
     effect_name     = paste0("effect_", slugs),
+    log_ratio_mean  = NA_real_,
+    log_ratio_sd    = NA_real_,
     ratio_q05       = NA_real_,
     ratio_q50       = NA_real_,
     ratio_q95       = NA_real_,
-    prob_ratio_gt_1 = NA_real_,
-    qualifies       = FALSE
+    prob_ratio_gt_1 = NA_real_
   )
 
   for (k in seq_along(special_types)) {
-    ratio <- exp(eta_draws[k + 1, ] - eta_draws[1, ])   # paired draw by draw
+    log_ratio <- eta_draws[k + 1, ] - eta_draws[1, ]   # paired draw by draw
+    ratio     <- exp(log_ratio)
+    contrasts$log_ratio_mean[k]  <- mean(log_ratio)
+    contrasts$log_ratio_sd[k]    <- stats::sd(log_ratio)
     contrasts$ratio_q05[k]       <- stats::quantile(ratio, 0.05)
     contrasts$ratio_q50[k]       <- stats::median(ratio)
     contrasts$ratio_q95[k]       <- stats::quantile(ratio, 0.95)
     contrasts$prob_ratio_gt_1[k] <- mean(ratio > 1)
-    contrasts$qualifies[k]       <- contrasts$ratio_q50[k] >= min_ratio &&
-                                    contrasts$prob_ratio_gt_1[k] >= min_prob
   }
 
-  choice$contrasts <- contrasts
-
-  # Switch the choice to a special type.
-  use_special <- function(choice, type, source) {
-    choice$survey_type <- type
-    choice$effect_name <- paste0("effect_", slugs[[type]])
-    choice$include_TOD <- isTRUE(mod$special_share_tod[[type]])
-    choice$include_DOY <- isTRUE(mod$special_share_doy[[type]])
-    if (choice$include_TOD) {
-      choice$Hours_After_Reference <- mod$special_ref_TOD[[type]]
-    }
-    choice$source <- source
-    choice
-  }
-
-  # ---- 1. A priori override ----
-  if (!is.na(override)) {
-    if (override %in% special_types) {
-      return(use_special(choice, override, "a priori override"))
-    }
-    warning(sp_english, ": override '", override, "' did not keep an ",
-            "intercept in this fit (absent or below its square threshold); ",
-            "using the fitted-contrast rule instead.", call. = FALSE)
-  }
-
-  # ---- 2. Fitted contrast ----
-  if (isTRUE(auto) && any(contrasts$qualifies)) {
-    qualifying <- contrasts[contrasts$qualifies, ]
-    best_type  <- qualifying$survey_type[which.max(qualifying$ratio_q50)]
-    return(use_special(choice, best_type, "fitted contrast"))
-  }
-
-  # ---- 3. Point-count default ----
-  choice
+  contrasts
 }
-
 
 # ============================================================
 # 5. Lognormal variance correction
